@@ -1,0 +1,60 @@
+{
+ "confession_1739_p866_fixture.json": {
+  "persons": 60,
+  "with_no": 58,
+  "with_age": 60,
+  "with_block": 60,
+  "with_yard": 60,
+  "settlements": [
+   "село Троицкое"
+  ]
+ },
+ "confession_1750_p136_fixture.json": {
+  "persons": 62,
+  "with_no": 62,
+  "with_age": 61,
+  "with_block": 62,
+  "with_yard": 59,
+  "settlements": [
+   "деревня Черепкова"
+  ]
+ },
+ "confession_1786_p152_fixture.json": {
+  "persons": 108,
+  "with_no": 106,
+  "with_age": 105,
+  "with_block": 108,
+  "with_yard": 97,
+  "settlements": [
+   "деревня Черепкова"
+  ]
+ },
+ "confession_1826_p185_fixture.json": {
+  "persons": 85,
+  "with_no": 83,
+  "with_age": 84,
+  "with_block": 83,
+  "with_yard": 85,
+  "settlements": []
+ },
+ "confession_1845_p892_fixture.json": {
+  "persons": 82,
+  "with_no": 82,
+  "with_age": 82,
+  "with_block": 82,
+  "with_yard": 82,
+  "settlements": [
+   "деревня Черепкова"
+  ]
+ },
+ "confession_1864_p884_fixture.json": {
+  "persons": 61,
+  "with_no": 59,
+  "with_age": 55,
+  "with_block": 61,
+  "with_yard": 59,
+  "settlements": [
+   "деревня Луки"
+  ]
+ }
+}

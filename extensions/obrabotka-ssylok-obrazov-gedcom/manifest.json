@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Обработка списка ссылок графических образов, и обработка их в Gedcom",
+  "version": "1.0.0",
+  "description": "Скачивает графические образы (сканы) страниц Яндекс Архива по списку ссылок (.html или .ged), сохраняет таблицу ссылок и записывает ссылки на сканы в GEDCOM-файл.",
+  "minimum_chrome_version": "120",
+  "action": {
+    "default_title": "Сбор данных из Яндекс Архива"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://ya.ru/*",
+    "https://yandex.ru/*"
+  ]
+}

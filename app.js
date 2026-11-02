@@ -19,6 +19,10 @@
 
   let linksDoc = null;       // разобранный HTML со ссылками
   let items = [];            // ссылки
+  let dlPlan = null;         // тип «Скачать графические образы»: {unique, entries} после удаления дубликатов
+  let linksText = '';        // содержимое выбранного файла ссылок
+  let linksKind = '';        // 'html' | 'ged' — определяется по расширению файла
+  let modeBeforeGed = null;  // тип обработки до автоматического переключения на .ged
   let running = false;
   let stopRequested = false;
   let resumeResolver = null;
@@ -26,13 +30,38 @@
   let appTabId = null;
   let fileHandle = null;
   let debugSaved = false;
+  let debugStamp = '';        // папка текущего запуска: yaarchive_debug/<время>
+  let linksDir = null;        // папка, где лежит файл ссылок (FileSystemDirectoryHandle); туда пишется yaarchive_debug/
+  let runDir = null;          // yaarchive_debug/<время>/ внутри linksDir
+  let writeChain = Promise.resolve();   // записи в папку идут по очереди
+  let debugIndex = [];        // сводка по страницам для run_summary.json
   let busyPicking = false;
 
-  let settings = { mode: Logic.DEFAULT_MODE, textSel: '', dateSel: '' };
+  // outFormat — вид результата в Excel ('confession' | 'revision'), не зависит от типа обработки;
+  // saveScans — сохранять оригиналы сканов в «Archive_Scans»
+  let settings = { mode: Logic.DEFAULT_MODE, textSel: '', dateSel: '', outFormat: '', saveScans: false, imagesMode: false };
+  let srcFile = null;        // выбранный файл со ссылок (FileSystemFileHandle) — «Выбрать файл со ссылками»
+  let outPicked = null;      // выбранная папка результата («Выбрать куда сохранить результат»)
+  let scanPicked = null;     // выбранная папка сканов («Archive_Scans»); без выбора — /Volumes/DATA/Archive_Scans
+  let scanRel = undefined;   // путь от result.xlsx к папке сканов (для «Локальная Ссылка на страницу»); null — не вычислить
 
   let families = [];         // семьи-дворы: {settlement, yard, persons[], notes[], url, year}
   let sheetRows = [];
   let linkRows = [];
+  let blockRecords = [];     // блоки текста (исповедные ведомости) — для проверки деления на людей
+  let rowRecords = [];       // строки таблицы внутри блоков «Крестьяне/Крестьянки» (режим «Ревизские сказки»)
+  let pageMeta = {};         // адрес страницы -> {cga, cgaUrl, scanName, scanFile, scanLocal, scanHref} для столбцов ссылок
+  const SCAN_DIR = 'Archive_Scans';
+  const SCAN_QUALITY = 0.4;  // JPG 40%, как в Scrpt_YA_Orig_Scan (для сканов в типах «Исповедные ведомости» / «Ревизские сказки»)
+  const DEFAULT_SCANS_PATH = '/Volumes/DATA/Archive_Scans';
+  // уровни качества — как в навыке «Сохранить Скан» (Scrpt_YA_Orig_Scan, YaOrigScan.QUALITY)
+  const QUALITY = { qOrig: { label: 'Оригинальное', percent: 100, value: 1 }, qMid: { label: 'Среднее', percent: 50, value: 0.5 },
+    qLow: { label: 'Низкое', percent: 20, value: 0.2 } };
+  let curQuality = SCAN_QUALITY;
+  let scanDir = null;        // FileSystemDirectoryHandle «Archive_Scans» (в папке результатов или в папке со ссылками)
+  let outDir = null;         // папка, выбранная кнопкой «Выбрать куда сохранять Excel, и начать»: result.xlsx + Archive_Scans/
+  let scanStats = { saved: 0, existed: 0, failed: 0, bytes: 0 };
+  let dlMode = false;        // идёт раздел 6: образы страниц по списку ссылок
 
   // ---------------------------------------------------------------- UI
   function log(msg) {
@@ -42,14 +71,49 @@
     el.scrollTop = el.scrollHeight;
   }
   function setStatus(s) { $('status').textContent = s; }
+
+  // шкала времени до окончания: всего страниц по всем ссылкам (без повторов), сделано, среднее время страницы
+  const progress = { total: 0, done: 0, t0: 0, times: [] };
+  const fmtDur = (ms) => {
+    const s = Math.max(0, Math.round(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    return (h ? h + ' ч ' : '') + (h || m ? m + ' мин ' : '') + (h ? '' : sec + ' с');
+  };
+  function progressStart(total) {
+    Object.assign(progress, { total, done: 0, t0: Date.now(), times: [] });
+    $('progressBox').style.display = 'block';
+    $('progressBar').max = Math.max(total, 1);
+    progressShow();
+  }
+  function progressStep(ms) {
+    progress.done++;
+    if (ms !== undefined) { progress.times.push(ms); if (progress.times.length > 30) progress.times.shift(); }
+    progressShow();
+  }
+  function progressShow(final) {
+    const { total, done, t0, times } = progress;
+    $('progressBar').value = Math.min(done, total);
+    const spent = Date.now() - t0;
+    const avg = times.length ? times.reduce((a, b) => a + b, 0) / times.length : 0;
+    const left = Math.max(0, total - done) * avg;
+    const pct = total ? Math.round(done / total * 100) : 0;
+    let t = `Страниц ${done} из ${total} (${pct}%) · прошло ${fmtDur(spent)}`;
+    if (final) t += ' · готово';
+    else if (avg) {
+      const end = new Date(Date.now() + left);
+      t += ` · осталось ≈ ${fmtDur(left)} · окончание ≈ ${end.toTimeString().slice(0, 5)}`;
+    } else t += ' · оценка времени — после первых страниц';
+    $('progressText').textContent = t;
+  }
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = ([a, b]) => a + Math.random() * (b - a);
   const mode = () => Logic.getMode(settings.mode);
 
   function setRunningUi(on) {
     $('startBtn').disabled = on;
-    $('linksFile').disabled = on;
+    ['pickFileBtn', 'pickOutBtn', 'pickScanBtn', 'useDefaults', 'scanPath', 'qOrig', 'qMid', 'qLow', 'gedWrite', 'gedSource', 'gedMedia', 'gedCopy', 'gedOrig'].forEach((id) => { $(id).disabled = on; });
     document.querySelectorAll('input[name="mode"]').forEach((r) => { r.disabled = on; });
+    $('outFormat').disabled = on;
+    $('saveScans').disabled = on;
     $('pickTextBtn').disabled = on;
     $('pickDateBtn').disabled = on;
     $('resetSelBtn').disabled = on;
@@ -65,29 +129,128 @@
   // ---------------------------------------------------------------- настройки
   async function loadSettings() {
     try {
-      const got = await chrome.storage.local.get(['mode', 'textSel', 'dateSel']);
+      const got = await chrome.storage.local.get(['mode', 'textSel', 'dateSel', 'outFormat', 'imagesMode']);
+      settings.imagesMode = !!got.imagesMode;
       if (got.mode && Logic.MODES[got.mode]) settings.mode = got.mode;
       settings.textSel = got.textSel || '';
       settings.dateSel = got.dateSel || '';
+      settings.outFormat = Logic.MODES[got.outFormat] ? got.outFormat : '';
+      settings.saveScans = false;      // флажки при запуске расширения сбрасываются
     } catch (e) { /* без сохранения — не критично */ }
   }
   async function saveSettings() {
     try { await chrome.storage.local.set(settings); } catch (e) { /* ignore */ }
   }
 
+  const imagesMode = () => !!settings.imagesMode;
+  const kindNow = () => (imagesMode() ? 'images' : settings.mode);
+  // форма диалога следует за типом обработки: элементы с data-only показываются только для своих типов
   function applyModeUi() {
     $('descConfession').textContent = Logic.MODES.confession.description;
     $('descRevision').textContent = Logic.MODES.revision.description;
-    document.querySelectorAll('input[name="mode"]').forEach((r) => { r.checked = r.value === settings.mode; });
+    $('descImages').textContent = 'Только сканы страниц и Excel со ссылками. Источник — файл .ged (генеалогический проект) или .html (список ссылок); ' +
+      'ссылки очищаются от «?center=», дубликаты удаляются. Диапазоны не раскрываются: берётся только страница, указанная в ссылке.';
+    const cur = kindNow();
+    document.querySelectorAll('input[name="mode"]').forEach((r) => { r.checked = r.value === cur; });
+    document.querySelectorAll('[data-only]').forEach((el) => { el.hidden = !el.dataset.only.split(' ').includes(cur); });
+    $('startBtn').textContent = 'Начать';
+    applyOutUi();
   }
+  // вид результата: по умолчанию как тип обработки, переключатель задаёт его явно
+  const outFormat = () => settings.outFormat || settings.mode;
+  function applyOutUi() {
+    $('outFormat').checked = outFormat() === 'revision';
+    $('saveScans').checked = settings.saveScans;
+    $('scanWrap').hidden = !(imagesMode() || settings.saveScans);
+    $('outFormatInfo').textContent = outFormat() === settings.mode
+      ? `Excel будет в виде «${Logic.MODES[outFormat()].label}» — как тип обработки.`
+      : `Excel будет в виде «${Logic.MODES[outFormat()].label}», хотя данные обрабатываются как «${Logic.MODES[settings.mode].label}».`;
+  }
+  $('outFormat').addEventListener('change', async () => {
+    settings.outFormat = $('outFormat').checked ? 'revision' : 'confession';
+    await saveSettings();
+    applyOutUi();
+    log(`Вид результата в Excel: ${Logic.MODES[outFormat()].label}.`);
+  });
+  $('saveScans').addEventListener('change', async () => {
+    settings.saveScans = $('saveScans').checked;
+    $('scanWrap').hidden = !(imagesMode() || settings.saveScans);
+    await saveSettings();
+    log(settings.saveScans ? `Сканы будут сохраняться в папку «${SCAN_DIR}».` : 'Сканы сохраняться не будут.');
+  });
+  // ---- выбор файла и папок: всегда конкретное место; с флажком «Использовать умолчания» берётся запомненное
+  const note = (id, text) => { $(id).textContent = text; };
+  function showNotes() {
+    note('srcNote', srcFile ? `Файл со ссылками: «${srcFile.name}»` : 'Файл не выбран');
+    note('outNote', outPicked ? `Результат сохраняется в папку: «${outPicked.name}»` : 'Папка результата не выбрана');
+    note('scanNote', scanPicked
+      ? `Сканы сохраняются в: «${scanPicked.name === SCAN_DIR ? scanPicked.name : scanPicked.name + '/' + SCAN_DIR}»`
+      : `Папка сканов не выбрана — по умолчанию ${DEFAULT_SCANS_PATH}`);
+    const isGed = linksKind === 'ged' && imagesMode();
+    $('gedBox').hidden = !isGed;
+    if (isGed) {
+      $('gedOpts').style.display = $('gedWrite').checked ? '' : 'none';
+      note('gedNote', $('gedWrite').checked
+        ? `После скачивания: ${$('gedMedia').checked ? 'общий медиа-объект' : 'источник'}; ${$('gedOrig').checked ? 'в исходный файл (копия до сканов — рядом)' : 'в копию _со_сканами.ged'}`
+        : 'Запись в GEDCOM не включена — файл .ged останется как есть');
+    }
+    const q = scanQualityId();
+    note('qNote', q ? `Качество скана: «${QUALITY[q].label}» — ${QUALITY[q].percent}%` : 'Качество не выбрано');
+  }
+  ['gedWrite', 'gedSource', 'gedMedia', 'gedCopy', 'gedOrig'].forEach((id) => $(id).addEventListener('change', showNotes));
+  function scanQualityId() { return Object.keys(QUALITY).find((id) => $(id).checked) || null; }
+  ['qOrig', 'qMid', 'qLow'].forEach((id) => $(id).addEventListener('change', () => {
+    if ($(id).checked) Object.keys(QUALITY).forEach((o) => { if (o !== id) $(o).checked = false; });   // один из трёх
+    showNotes();
+  }));
+  async function pickDir(id, key) {
+    if (!window.showDirectoryPicker) { setStatus('Этот Chrome не умеет выбирать папку.'); return null; }
+    try {
+      const h = await window.showDirectoryPicker({ id, mode: 'readwrite' });
+      await idb((st) => st.put(h, key)).catch(() => {});
+      return h;
+    } catch (e) {
+      if (!(e && e.name === 'AbortError')) setStatus('Папку выбрать не удалось: ' + (e && e.message) +
+        ' (Chrome не даёт доступ к корню диска и системным папкам — выберите вложенную папку).');
+      return null;
+    }
+  }
+  $('pickOutBtn').addEventListener('click', async () => {
+    const h = await pickDir('yaarchive-out', 'outPicked');
+    if (h) { outPicked = h; log(`Результат будет сохраняться в «${h.name}».`); }
+    showNotes();
+  });
+  $('pickScanBtn').addEventListener('click', async () => {
+    const h = await pickDir('yaarchive-scans', 'scanPicked');
+    if (h) { scanPicked = h; log(`Сканы будут сохраняться в «${h.name === SCAN_DIR ? h.name : h.name + '/' + SCAN_DIR}».`); }
+    showNotes();
+  });
+  // «Использовать умолчания»: запомненные файл и папки (подтверждение доступа — прямо по щелчку по флажку)
+  $('useDefaults').addEventListener('change', async () => {
+    if (!$('useDefaults').checked) { log('Умолчания отключены: файл и папки выбираются вручную.'); return; }
+    let got = 0;
+    try {
+      const f = await idb((st) => st.get('srcFile'));
+      if (f && (await filePermission(f, true))) { srcFile = f; await loadSource(f); got++; }
+      const o = await idb((st) => st.get('outPicked'));
+      if (o && (await dirPermission(o, true))) { outPicked = o; got++; }
+      const sc = await idb((st) => st.get('scanPicked'));
+      if (sc && (await dirPermission(sc, true))) { scanPicked = sc; got++; }
+    } catch (e) { /* нет запомненного */ }
+    showNotes();
+    log(got ? 'Умолчания: подставлены запомненные файл и папки.' : 'Умолчаний пока нет: выберите файл и папки один раз — они запомнятся.');
+  });
 
   document.querySelectorAll('input[name="mode"]').forEach((r) => {
     r.addEventListener('change', async () => {
       if (!r.checked) return;
-      settings.mode = r.value;
+      modeBeforeGed = null;
+      if (r.value === 'images') settings.imagesMode = true;
+      else { settings.imagesMode = false; settings.mode = r.value; settings.outFormat = ''; }   // вид результата снова следует за типом
       await saveSettings();
-      reparseLinks();
-      log(`Тип обработки: ${mode().label}.`);
+      applyModeUi();
+      refreshSource();
+      log(`Тип обработки: ${imagesMode() ? 'Скачать графические образы страниц' : mode().label}.`);
     });
   });
 
@@ -113,12 +276,37 @@
     log('Остановка запрошена — дорабатываю текущую страницу и сохраняю результат...');
     if (resumeResolver) resumeResolver();
   });
-  $('saveBtn').addEventListener('click', async () => { await saveResult(true); });
+  $('saveBtn').addEventListener('click', async () => { if (dlMode) await saveLinksResult(true); else await saveResult(true); });
   window.addEventListener('beforeunload', (e) => {
     if (running) { e.preventDefault(); e.returnValue = ''; }
   });
 
   // ------------------------------------------------------ список ссылок
+  // Тип файла определяет обработку: .ged — только образы страниц; .html — список ссылок для выбранного типа
+  function sourceInfo(text) { $('linksInfo').textContent = text; }
+  function refreshSource() {
+    items = []; dlPlan = null; linksDoc = null;
+    if (!linksText) return;
+    const name = srcFile ? srcFile.name : 'файл';
+    if (linksKind === 'ged' && !imagesMode()) {
+      sourceInfo(`${name}: файл GEDCOM обрабатывается только в типе «Скачать графические образы страниц».`);
+      return;
+    }
+    if (imagesMode()) {
+      const src = linksKind === 'ged' ? LinksTools.gedcomLinks(linksText) : LinksTools.htmlLinks(linksText);
+      dlPlan = src.length ? LinksTools.buildPlan(src, { expandRange: false }) : null;
+      if (!dlPlan) sourceInfo(`${name}: ссылок ya.ru / yandex.ru не найдено.`);
+      else {
+        const st = (re) => dlPlan.entries.filter((e) => re.test(e.status)).length;
+        sourceInfo(`${name}: найдено ссылок ${src.length}; уникальных страниц ${dlPlan.unique.length}; дубликатов ${st(/^дубликат/)}; ` +
+          `пропущено (нет номера страницы или не архив) ${st(/^пропущена/)}.`);
+      }
+      return;
+    }
+    linksDoc = new DOMParser().parseFromString(linksText, 'text/html');
+    reparseLinks();
+    $('linksInfo').textContent = `${name}: ` + $('linksInfo').textContent;
+  }
   function reparseLinks() {
     items = linksDoc ? Logic.parseLinks(linksDoc, settings.mode) : [];
     if (!linksDoc) return;
@@ -128,18 +316,67 @@
       : 'В файле не найдено ссылок Яндекс Архива.';
   }
 
-  $('linksFile').addEventListener('change', async (e) => {
-    const f = e.target.files[0];
-    linksDoc = null;
-    items = [];
-    if (!f) { $('linksInfo').textContent = 'Файл не выбран'; return; }
+  // ---- папка с файлом ссылок: в неё же сохраняются результаты (yaarchive_debug/<время запуска>/)
+  const IDB = { db: 'yaarchive', store: 'handles' };
+  function idb(fn) {
+    return new Promise((resolve, reject) => {
+      const rq = indexedDB.open(IDB.db, 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore(IDB.store);
+      rq.onerror = () => reject(rq.error);
+      rq.onsuccess = () => {
+        const tx = rq.result.transaction(IDB.store, 'readwrite');
+        const r = fn(tx.objectStore(IDB.store));
+        tx.oncomplete = () => resolve(r && r.result);
+        tx.onerror = () => reject(tx.error);
+      };
+    });
+  }
+  const outLabel = () => (linksDir ? `«${linksDir.name}/yaarchive_debug/${debugStamp || '<время запуска>'}/»`
+    : `«Загрузки/yaarchive_debug/${debugStamp || '<время запуска>'}/»`);
+
+  async function dirPermission(handle, ask) {
+    const o = { mode: 'readwrite' };
+    if ((await handle.queryPermission(o)) === 'granted') return true;
+    return ask ? (await handle.requestPermission(o)) === 'granted' : false;
+  }
+
+  async function filePermission(handle, ask) {
+    const o = { mode: 'read' };
+    if ((await handle.queryPermission(o)) === 'granted') return true;
+    return ask ? (await handle.requestPermission(o)) === 'granted' : false;
+  }
+  async function loadSource(handle) {
+    const name = handle.name;
     try {
-      linksDoc = new DOMParser().parseFromString(await f.text(), 'text/html');
+      const f = await handle.getFile();
+      linksText = LinksTools.decodeBytes(new Uint8Array(await f.arrayBuffer()));
+      linksKind = /\.ged$/i.test(name) ? 'ged' : 'html';
+      if (linksKind === 'ged' && !imagesMode()) {          // .ged обрабатывается только как «образы страниц»
+        modeBeforeGed = false; settings.imagesMode = true; await saveSettings(); applyModeUi();
+        log(`Файл ${name} — GEDCOM: выбран тип «Скачать графические образы страниц».`);
+      } else if (linksKind === 'html' && modeBeforeGed === false) {   // вернулись к .html — прежний тип
+        modeBeforeGed = null; settings.imagesMode = false; await saveSettings(); applyModeUi();
+      }
+      refreshSource();
     } catch (err) {
-      $('linksInfo').textContent = 'Не удалось прочитать файл: ' + err.message;
-      return;
+      linksText = ''; linksKind = ''; refreshSource();
+      $('linksInfo').textContent = `Не удалось прочитать ${name}: ${err.message}`;
     }
-    reparseLinks();
+    showNotes();
+  }
+
+  $('pickFileBtn').addEventListener('click', async () => {
+    if (!window.showOpenFilePicker) { $('linksInfo').textContent = 'Этот Chrome не умеет выбирать файл.'; return; }
+    try {
+      const [h] = await window.showOpenFilePicker({ id: 'yaarchive-links', multiple: false,
+        types: [{ description: 'Список ссылок (.html) или проект (.ged)', accept: { 'text/html': ['.html', '.htm'], 'text/plain': ['.ged'] } }] });
+      srcFile = h;
+      await idb((st) => st.put(h, 'srcFile')).catch(() => {});
+      await loadSource(h);
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      $('linksInfo').textContent = 'Файл выбрать не удалось: ' + (e && e.message);
+    }
   });
 
   // ------------------------------------------------------ рабочая вкладка
@@ -160,10 +397,32 @@
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        clearInterval(poll);
         chrome.tabs.onUpdated.removeListener(onUpd);
         err ? reject(err) : resolve();
       };
       const timer = setTimeout(() => done(new Error('таймаут загрузки страницы')), timeoutMs);
+      // подстраховка: событие «загрузка» может прийти раньше подписки — проверяем вкладку раз в секунду
+      const want = String(url).replace(/#.*$/, '');
+      const started = Date.now();
+      let kicks = 0;
+      const poll = setInterval(async () => {
+        if (finished) { clearInterval(poll); return; }
+        try {
+          const t = await chrome.tabs.get(tabId);
+          if (Date.now() - started > 1500 && t.status === 'complete' && String(t.url || '').replace(/#.*$/, '') === want) done();
+          // фоновая вкладка иногда не начинает загрузку («unloaded») — повторяем переход (до двух раз)
+          else if (!sawLoading && kicks < 2 && Date.now() - started > 8000 * (kicks + 1) && (t.status === 'unloaded' || t.url !== want)) {
+            kicks++;
+            chrome.tabs.update(tabId, { url }).catch(() => {});
+          } else if (kicks >= 2 && Date.now() - started > 24000 && t.status === 'unloaded') {
+            // вкладка так и не загрузилась — закрываем её, следующая попытка откроет новую
+            if (tabId === workTabId) workTabId = null;
+            chrome.tabs.remove(tabId).catch(() => {});
+            done(new Error('рабочая вкладка не загружается — открываю новую'));
+          }
+        } catch (e) { /* вкладка закрыта — сработает таймаут */ }
+      }, 1000);
       const onUpd = (id, info) => {
         if (id !== tabId) return;
         if (info.status === 'loading') sawLoading = true;
@@ -197,27 +456,37 @@
         }
         if ((tab.url || '').startsWith('chrome-error')) throw new Error('страница не загрузилась (ошибка сети)');
 
-        const wantHtml = $('debugHtml').checked && !debugSaved;
+        const wantHtml = $('debugHtml').checked && !debugSaved && !dlMode;
         const [inj] = await chrome.scripting.executeScript({
           target: { tabId },
           func: PageScripts.pageExtractor,
-          args: [{ textSel: settings.textSel, dateSel: settings.dateSel, maxWait: CFG.RENDER_WAIT, wantHtml }],
+          args: [{ textSel: settings.textSel, dateSel: settings.dateSel, maxWait: CFG.RENDER_WAIT, wantHtml,
+                  useNext: true, nextOnly: dlMode }],
         });
         const res = (inj && inj.result) || { found: false, text: '', date: '' };
-        if (wantHtml && res.html) {
-          downloadBlob(new Blob([res.html], { type: 'text/html;charset=utf-8' }), 'first_page.html');
-          if (res.debug) {
-            downloadBlob(new Blob([JSON.stringify(res.debug)], { type: 'application/json' }), 'first_page_debug.json');
-          }
-          debugSaved = true;
-          log('Сохранены отладочные файлы first_page.html и first_page_debug.json (папка «Загрузки»).');
+        if (!res.found && !res.nextNode && attempt < CFG.MAX_RETRIES) {      // страница не успела отдать данные — пробуем ещё раз
+          lastErr = 'окно распознанного текста не найдено';
+          log(`  страница ${n}: данных нет, повтор ${attempt + 2}/${CFG.MAX_RETRIES + 1}`);
+          await sleep(3000);
+          continue;
         }
-        if (n !== undefined && res.found) {
+        if (wantHtml && res.html) {
+          saveOut('first_page.html', new Blob([res.html], { type: 'text/html;charset=utf-8' }));
+          if (res.debug) saveOut('first_page_debug.json', new Blob([JSON.stringify(res.debug)], { type: 'application/json' }));
+          if (res.nextNode) saveOut('first_page_next_data.json', new Blob([JSON.stringify(res.nextNode)], { type: 'application/json' }));
+          debugSaved = true;
+          log(`Отладочные файлы первой страницы: ${outLabel()} first_page.html, first_page_debug.json / first_page_next_data.json.`);
+        }
+        if (dlMode) { /* образы страниц: блоки текста не разбираются */ }
+        else if (n !== undefined && res.nextNode) {
+          log(`  стр. ${n}: данные страницы (${res.nextHow}), блоков: ${res.nextNode.joinedTextBlocks.length}`);
+        } else if (n !== undefined && res.found) {
           log(`  стр. ${n}: окно текста — ${res.textHow}, знаков: ${res.text.length}; ` +
               `блоков с координатами: в окне текста ${(res.textBlocks || []).length}, на скане ${(res.overlayBlocks || []).length}`);
         }
         return {
-          url, text: res.text || '', date: res.date || '', found: !!res.found,
+          url, text: res.text || '', date: res.date || '', found: !!res.found, nextNode: res.nextNode || null, tabId,
+          origin: res.origin || 'https://ya.ru',
           candidates: [
             { name: 'окно текста', blocks: res.textBlocks || [] },
             { name: 'скан', blocks: res.overlayBlocks || [] },
@@ -233,13 +502,111 @@
     return { url, text: '', date: '', found: false, err: lastErr || 'ошибка' };
   }
 
-  async function ensureLogin() {
-    const tabId = await getWorkTab();
-    log('Проверяю вход в Яндекс...');
+  // ------------------------------------------------------ сканы (Scrpt_YA_Orig_Scan)
+  // Путь «Главная/Каталог/ЦГА Москвы/Фонд/Опись/Дело/Скан» и имя файла — по данным страницы (без лишних запросов).
+  // Скан: в папку «Archive_Scans» рядом с файлом ссылок (уже сохранённые не скачиваются повторно);
+  // если выбран только файл ссылок — в «Загрузки/Archive_Scans/». Ссылка из result.xlsx (yaarchive_debug/<время>/) —
+  // относительная: ../../Archive_Scans/<файл>.
+  function noteMeta(r, n) {
+    if (!r || !r.nextNode) return;
+    const ci = ExcelSheets.crumbInfo(r.nextNode.crumbs, n, r.nextNode.id, r.origin);
+    pageMeta[r.url] = Object.assign(pageMeta[r.url] || {}, { cga: ci.cga, cgaUrl: ci.cgaUrl, scanName: ci.scanName, docType: ci.docType });
+  }
+  // Папка сканов: выбранная флажком «Выбрать куда сохранить» (сама «Archive_Scans» или «Archive_Scans» внутри неё),
+  // иначе «Archive_Scans» в папке результатов (outDir), иначе — в папке со ссылками.
+  async function getScanDir() {
+    if (scanDir) return scanDir;
+    if (scanPicked) {
+      try {
+        scanDir = scanPicked.name === SCAN_DIR ? scanPicked : await scanPicked.getDirectoryHandle(SCAN_DIR, { create: true });
+      } catch (e) { log(`Не удалось открыть выбранную папку сканов «${scanPicked.name}» (${e.message}).`); }
+    }
+    const base = outDir || linksDir;
+    if (!scanDir && base) {
+      try { scanDir = await base.getDirectoryHandle(SCAN_DIR, { create: true }); } catch (e) {
+        log(`Не удалось создать папку «${SCAN_DIR}» в ${base.name} (${e.message}) — сканы пойдут в «Загрузки/${SCAN_DIR}/».`);
+      }
+    }
+    if (scanDir && scanRel === undefined) {
+      // путь от файла result.xlsx до папки сканов: result.xlsx в outDir или в <папка ссылок>/yaarchive_debug/<запуск>/
+      scanRel = null;
+      try {
+        if (outDir) { const p = await outDir.resolve(scanDir); if (p) scanRel = p.join('/'); }
+        else if (linksDir) { const p = await linksDir.resolve(scanDir); if (p) scanRel = ['..', '..'].concat(p).join('/'); }
+      } catch (e) { /* не вычислить */ }
+    }
+    return scanDir;
+  }
+  // Файл уже есть в Archive_Scans — не скачиваем его повторно и переходим к следующему.
+  async function scanExists(name) {
+    const d = await getScanDir();
+    if (!d) return false;
+    try { await d.getFileHandle(name); return true; } catch (e) { return false; }
+  }
+  // Ссылка из Excel на скан: result.xlsx в папке результатов -> «Archive_Scans/…»,
+  // result.xlsx в yaarchive_debug/<время>/ -> «../../Archive_Scans/…».
+  // Локальный путь к папке «Archive_Scans» — всегда абсолютный (по умолчанию /Volumes/DATA/Archive_Scans/); столбец
+  // «Локальная Ссылка на страницу» = этот путь + имя файла графического образа, ссылка — file://…
+  const scanAbs = () => ($('scanPath').value.trim() || DEFAULT_SCANS_PATH).replace(/\/+$/, '');
+  const scanLocalFor = (name) => `${scanAbs()}/${name}`;
+  function scanHrefFor(name) { return `file://${encodeURI(scanAbs())}/${encodeURIComponent(name)}`; }
+  // -> время, потраченное на скан (мс), чтобы сократить паузу между страницами
+  async function saveScan(r, n) {
+    const t0 = Date.now();
+    const m = pageMeta[r.url];
+    if (!m || !r.nextNode || !r.nextNode.id) return 0;
+    const setFile = () => Object.assign(m, { scanFile: `${SCAN_DIR}/${m.scanName}`, scanLocal: scanLocalFor(m.scanName), scanHref: scanHrefFor(m.scanName) });
+    if (await scanExists(m.scanName)) {
+      scanStats.existed++; setFile();
+      log(`  стр. ${n}: скан ${m.scanName} уже есть — пропущен.`);
+      return 0;
+    }
+    let res = null;
     try {
-      await navigate(tabId, 'https://ya.ru/archive', 60000);
+      const [inj] = await chrome.scripting.executeScript({ target: { tabId: r.tabId }, func: PageScripts.scanFetcher, args: [r.nextNode.id, curQuality] });
+      res = inj && inj.result;
+    } catch (e) { res = { ok: false, err: e.message }; }
+    if (!res || !res.ok) {
+      scanStats.failed++;
+      m.scanErr = (res && res.err) || 'нет ответа';
+      log(`  стр. ${n}: скан не сохранён — ${m.scanErr}`);
+      return Date.now() - t0;
+    }
+    const bin = atob(res.b64), bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const blob = new Blob([bytes], { type: 'image/jpeg' });
+    const d = await getScanDir();
+    try {
+      if (d) {
+        const w = await (await d.getFileHandle(m.scanName, { create: true })).createWritable();
+        await w.write(blob); await w.close();
+      } else {
+        const url = URL.createObjectURL(blob);
+        await new Promise((ok) => chrome.downloads.download({ url, filename: `${SCAN_DIR}/${m.scanName}`, conflictAction: 'overwrite', saveAs: false }, () => ok()));
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+      }
+      setFile();
+      scanStats.saved++; scanStats.bytes += res.size;
+      log(`  стр. ${n}: скан ${m.scanName} (${res.w}×${res.h}, ${Math.round(res.origSize / 1024)} КБ → ${Math.round(res.size / 1024)} КБ)`);
     } catch (e) {
-      log('Страница ya.ru/archive открылась с ошибкой: ' + e.message);
+      scanStats.failed++;
+      m.scanErr = 'не записан: ' + e.message;
+      log(`  стр. ${n}: скан не записан — ${e.message}`);
+    }
+    return Date.now() - t0;
+  }
+
+  async function ensureLogin() {
+    let tabId = await getWorkTab();
+    log('Проверяю вход в Яндекс...');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await navigate(tabId, 'https://ya.ru/archive', 60000);
+        break;
+      } catch (e) {
+        log('Страница ya.ru/archive открылась с ошибкой: ' + e.message);
+        tabId = await getWorkTab();          // если вкладка была закрыта как незагружающаяся — новая
+      }
     }
     const tab = await chrome.tabs.get(tabId);
     const onArchive = /^https:\/\/(ya\.ru|yandex\.ru)\/archive/.test(tab.url || '');
@@ -309,43 +676,9 @@
   });
 
   // ------------------------------------------------------------- Excel
-  const trunc = (v) => (typeof v === 'string' ? v.slice(0, 32000) : v === null || v === undefined ? '' : v);
-
-  function widthsFor(rows) {
-    const cols = Math.max(...rows.map((r) => r.length));
-    const out = [];
-    for (let c = 0; c < cols; c++) {
-      let w = 8;
-      rows.slice(0, 200).forEach((r) => {
-        const v = r[c];
-        if (v !== '' && v !== null && v !== undefined) w = Math.max(w, String(v).length);
-      });
-      out.push(Math.min(Math.max(w + 2, 10), 70));
-    }
-    return out;
-  }
-
   function buildSheets() {
-    // Одна строка = одна семья-двор. Все люди двора — в одной ячейке (каждый с новой строки).
-    // Ссылка на страницу — только у строки семьи-двора.
-    const peopleRows = [['Год', 'Населённый пункт', 'Двор №', 'Люди двора (№ м/ж, как распознано, возраст)', 'Примечание', 'Ссылка на страницу']];
-    families.forEach((f) => peopleRows.push([f.year, f.settlement, f.yard, Layout.familyCell(f), f.notes.join('; '), f.url].map(trunc)));
-
-    const pageRows = [['Год', 'Найденные НП округи', 'Ссылка', 'Распознанный текст страницы']];
-    sheetRows.forEach((r) => pageRows.push([r.year, r.found, r.url, r.text].map(trunc)));
-
-    const linkOut = [['Год', 'Исходная ссылка', 'Диапазон из ссылки', 'Просмотрено страниц',
-      'Найдено НП (шт.)', 'Какие НП', 'Решение', 'Дворов (семей)', 'Людей', 'Как собрано', 'Примечание']];
-    linkRows.forEach((r) => linkOut.push(r.map(trunc)));
-
-    const w = (rows) => widthsFor(rows);
-    const peopleWidths = w(peopleRows);
-    peopleWidths[3] = 60;
-    return [
-      { name: 'Люди', rows: peopleRows, widths: peopleWidths },
-      { name: 'Страницы', rows: pageRows, widths: w(pageRows) },
-      { name: 'Ссылки', rows: linkOut, widths: w(linkOut) },
-    ];
+    return ExcelSheets.build({ processMode: settings.mode, outFormat: outFormat(), families, rowRecords, blockRecords,
+      sheetRows, linkRows, pageMeta }, { ConfessionRows, Layout, STYLE: XlsxWriter.STYLE });
   }
 
   function downloadBlob(blob, name) {
@@ -358,25 +691,87 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   }
 
-  // download=true — если файл не выбран заранее, скачать копию в «Загрузки»
-  async function saveResult(download) {
+  // Все результаты и отладочные файлы запуска — в одну папку yaarchive_debug/<время запуска>/:
+  //  выбрана папка со ссылками -> прямо в неё (File System Access API);
+  //  выбран только файл        -> «Загрузки/yaarchive_debug/<время>/» (chrome.downloads), иначе обычное скачивание.
+  async function writeToRunDir(name, blob) {
+    if (!runDir) {
+      const dbg = await linksDir.getDirectoryHandle('yaarchive_debug', { create: true });
+      runDir = await dbg.getDirectoryHandle(debugStamp, { create: true });
+    }
+    const w = await (await runDir.getFileHandle(name, { create: true })).createWritable();
+    await w.write(blob);
+    await w.close();
+  }
+  function downloadToFolder(name, blob) {
+    const fname = `yaarchive_debug/${debugStamp}/${name}`;
+    try {
+      if (chrome.downloads && chrome.downloads.download) {
+        const url = URL.createObjectURL(blob);
+        chrome.downloads.download({ url, filename: fname, conflictAction: 'overwrite', saveAs: false }, () => {
+          setTimeout(() => URL.revokeObjectURL(url), 30000);
+        });
+        return;
+      }
+    } catch (e) { /* запасной путь ниже */ }
+    downloadBlob(blob, fname.replace(/\//g, '_'));
+  }
+  // папка запуска: <дата_время>_v<версия расширения> — видно, какой версией собраны отладочные файлы
+  function runStamp() { return `${localStamp()}_v${chrome.runtime.getManifest().version}`; }
+  function localStamp() {      // местное время: 2026-10-27_10-52-03
+    const d = new Date(), z = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}_${z(d.getHours())}-${z(d.getMinutes())}-${z(d.getSeconds())}`;
+  }
+  function saveOut(name, blob) {
+    if (!debugStamp) debugStamp = runStamp();
+    writeChain = writeChain.then(async () => {
+      if (linksDir) {
+        try { await writeToRunDir(name, blob); return; } catch (e) {
+          log(`Не удалось записать ${name} в папку ${linksDir.name} (${e.message}) — сохраняю в «Загрузки».`);
+        }
+      }
+      downloadToFolder(name, blob);
+    });
+    return writeChain;
+  }
+  // обязательные данные для общего скрипта yaarchive — независимо от галочки отладки
+  function saveData(name, obj) {
+    saveOut(name, new Blob([JSON.stringify(obj)], { type: 'application/json' }));
+  }
+  function saveDebug(name, obj) {
+    if (!$('debugAll').checked) return;
+    saveOut(name, new Blob([typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1)], { type: 'application/json' }));
+  }
+
+  // Excel всегда сохраняется в папку запуска (result.xlsx, перезаписывается по ходу работы);
+  // если выбран «спросить, куда сохранить» — ещё и копия в выбранный файл.
+  async function saveResult(final) {
     const bytes = await XlsxWriter.build(buildSheets());
+    if (outDir) {
+      // папка, выбранная кнопкой «Выбрать куда сохранять Excel, и начать»: result.xlsx рядом с Archive_Scans/
+      writeChain = writeChain.then(async () => {
+        try {
+          const w = await (await outDir.getFileHandle('result.xlsx', { create: true })).createWritable();
+          await w.write(bytes); await w.close();
+        } catch (e) {
+          log(`Не удалось записать result.xlsx в ${outDir.name} (${e.message}) — сохраняю в папку запуска.`);
+          downloadToFolder('result.xlsx', new Blob([bytes], { type: XLSX_MIME }));
+        }
+      });
+      await writeChain;
+    } else {
+      await saveOut('result.xlsx', new Blob([bytes], { type: XLSX_MIME }));
+    }
     if (fileHandle) {
       try {
         const w = await fileHandle.createWritable();
         await w.write(bytes);
         await w.close();
-        log(`Сохранено: дворов ${families.length}, страниц ${sheetRows.length}.`);
-        return true;
       } catch (e) {
-        log('Не удалось записать в выбранный файл (' + e.message + '). Скачиваю копию в «Загрузки».');
-        download = true;
+        log('Не удалось записать в выбранный файл (' + e.message + ').');
       }
     }
-    if (download) {
-      downloadBlob(new Blob([bytes], { type: XLSX_MIME }), 'result.xlsx');
-      log('Файл result.xlsx скачан в папку «Загрузки».');
-    }
+    if (final) log(`Excel сохранён: ${outDir ? `«${outDir.name}/»` : outLabel()} result.xlsx (дворов ${families.length}, страниц ${sheetRows.length}).`);
     return true;
   }
 
@@ -385,14 +780,28 @@
     running = true;
     stopRequested = false;
     debugSaved = false;
+    debugIndex = [];
+    debugStamp = runStamp();
+    runDir = null;
     families = [];
     sheetRows = [];
     linkRows = [];
+    rowRecords = [];
+    blockRecords = [];
+    pageMeta = {};
+    scanDir = null;
+    scanRel = undefined;
+    scanStats = { saved: 0, existed: 0, failed: 0, bytes: 0 };
     const m = mode();
     const pageCache = new Map();     // `${fileId}:${page}` -> {url,text,date,found,err}
     let misses = 0;
     setRunningUi(true);
-    log(`Тип обработки: ${m.label}. Окно текста: ${settings.textSel || 'авто'}; дата: ${settings.dateSel || 'авто'}.`);
+    log(`Тип обработки: ${m.label}. Вид Excel: ${Logic.MODES[outFormat()].label}. Сканы: ${settings.saveScans ? `сохранять в «${SCAN_DIR}»` : 'нет'}. ` +
+        `Окно текста: ${settings.textSel || 'авто'}; дата: ${settings.dateSel || 'авто'}.`);
+    // всего страниц для шкалы времени (одна страница в нескольких ссылках считается один раз)
+    const allPages = new Set();
+    for (const it of items) if (it.fileId && it.pFrom !== null) for (let n = it.pFrom; n <= it.pTo; n++) allPages.add(`${it.fileId}:${n}`);
+    progressStart(allPages.size);
 
     try {
       const cur = await chrome.tabs.getCurrent();
@@ -421,8 +830,14 @@
           if (!pageCache.has(key)) {
             setStatus(`${tag}: страница ${n} (диапазон ${lo}–${hi})`);
             log(`${tag}: загружаю страницу ${n} (диапазон ${lo}–${hi})...`);
+            const tPage = Date.now();
             const r = await fetchSheet(it.fileId, n);
             pageCache.set(key, r);
+            noteMeta(r, n);
+            if (r.err && !stopRequested) log(`  ВНИМАНИЕ: страница ${n} (${it.year ?? '—'}) не загружена: ${r.err}`);
+            // скан сохраняется, пока рабочая вкладка ещё на этой странице; время скана идёт в счёт паузы
+            let scanMs = 0;
+            if (settings.saveScans && r.nextNode && !stopRequested) scanMs = await saveScan(r, n);
             if (!r.found && !stopRequested) {
               if (++misses >= CFG.MAX_MISSES) {
                 stopRequested = true;
@@ -432,7 +847,8 @@
             } else if (r.found) {
               misses = 0;
             }
-            if (n < hi) await sleep(rand(CFG.DELAY));
+            if (n < hi) await sleep(Math.max(0, rand(CFG.DELAY) - scanMs));
+            progressStep(Date.now() - tPage);
           }
           texts.set(n, pageCache.get(key));
         }
@@ -450,21 +866,59 @@
         const fams = [];
         const hows = new Set();
         const yrOf = (v) => { const mm = String(v || '').match(/(?<!\d)(1[5-9]\d\d)(?!\d)/); return mm ? parseInt(mm[1], 10) : null; };
+        if (!it.year) {         // в файле ссылок года нет — по названию дела («… 6 ревизия …» → 1811)
+          const first = [...texts.values()].find((x) => x.nextNode && x.nextNode.crumbs);
+          const file = first ? (first.nextNode.crumbs.find((c) => c.type === 'File') || {}).name : '';
+          it.year = Logic.yearFromText(file) || null;
+          if (it.year) it.note = (it.note ? it.note + '; ' : '') + `год ${it.year} — по названию дела`;
+        }
         for (const n of [...texts.keys()].sort((a, b) => a - b)) {
           const r = texts.get(n);
-          sheetRows.push({
+          const sr = {
             year: it.year, page: n,
             found: [...perPage.get(n)].sort().join('; '),
-            url: r.url, text: r.err ? `ОШИБКА: ${r.err}` : r.text,
-          });
-          if (r.err) continue;
-          hows.add(Layout.processPage({ candidates: r.candidates, text: r.text, url: r.url, page: n }, state, m.id, fams));
+            url: r.url, text: r.err ? `ОШИБКА: ${r.err}` : r.text, check: '',
+          };
+          sheetRows.push(sr);
+          if (r.err) {      // страница не загрузилась — общий скрипт предложит дозагрузку
+            debugIndex.push({ year: it.year, fileId: it.fileId, page: n, url: r.url, how: 'ошибка загрузки', error: r.err, flags: [], halves: [], check: '' });
+            continue;
+          }
+          let how = null;
+          const tag8 = String(it.fileId).slice(0, 8);
+          // данные страницы — вход общего скрипта yaarchive: сохраняются всегда, в обоих режимах
+          if (r.nextNode) saveData(`${it.year || 'год'}_${tag8}_p${n}_next_data.json`, { props: { pageProps: { url: r.url, docNumber: n, year: it.year, fileId: it.fileId, mode: m.id, currentNode: r.nextNode } } });
+          if (r.nextNode && m.id === 'revision') {
+            how = Layout.processNode(r.nextNode, { url: r.url, page: n }, state, m.id, fams);
+            debugIndex.push({ year: it.year, fileId: it.fileId, page: n, url: r.url, how, flags: [], halves: [], check: state.checks[n] || '' });
+          }
+          if (r.nextNode && m.id === 'confession') {
+            state.lastRep = null;
+            how = Layout.processConfessionNode(r.nextNode, { url: r.url, page: n, year: it.year }, state, m.id, fams);
+            if (state.lastRep) {
+              for (const mk of state.lastRep.settlement_marks) if (!String(mk.name).startsWith('other:')) { perPage.get(n).add(mk.name); foundAll.add(mk.name); }
+              sr.found = [...perPage.get(n)].sort().join('; ');
+            }
+            if (state.lastRep) saveDebug(`${it.year || 'год'}_${tag8}_p${n}_confession.json`, state.lastRep);
+            debugIndex.push({ year: it.year, fileId: it.fileId, page: n, url: r.url, how,
+              flags: state.lastRep ? state.lastRep.flags : [], halves: state.lastRep ? state.lastRep.halves.map((h) => ({ no: h.no, columns: h.columns, people: h.people })) : [],
+              check: state.checks[n] || '' });
+          }
+          if (!how) how = Layout.processPage({ candidates: r.candidates, text: r.text, url: r.url, page: n }, state, m.id, fams);
+          sr.check = state.checks[n] || '';
+          hows.add(how);
         }
         Layout.finish(state, fams);
         const docYear = it.year || yrOf(it.url) || '';
         fams.forEach((f) => { f.year = docYear; });
         families.push(...fams);
-        const persons = fams.reduce((acc, f) => acc + f.persons.length, 0);
+        const kindWarn = Logic.kindWarning([...texts.values()].map((x) => Logic.pageKindByText(x.text)), m.id);
+        if (kindWarn) { log(`${tag}: ${kindWarn}`); if (state.rows.length) state.rows[0].notes.push(kindWarn); }
+        state.rows.forEach((r) => rowRecords.push(Object.assign({ year: docYear }, r)));
+        (state.blocks || []).forEach((b) => blockRecords.push(Object.assign({ year: docYear }, b)));
+        const persons = m.id === 'confession'
+          ? fams.reduce((acc, f) => acc + f.persons.reduce((a, p) => a + (p.rows && p.rows.length ? p.rows.length : 1), 0), 0)
+          : fams.reduce((acc, f) => acc + f.persons.length, 0);
 
         const total = hi - lo + 1;
         const verdict = texts.size < total
@@ -472,46 +926,368 @@
           : 'ОБРАБОТАНА';
         linkRows.push([it.year, it.url, rng, texts.size, foundAll.size,
           [...foundAll].sort().join('; '), verdict, fams.length, persons, [...hows].join('; '),
-          [it.note, state.dropped ? `отброшено служебных строк: ${state.dropped}` : ''].filter(Boolean).join('; ')]);
+          [kindWarn, it.note, state.dropped ? `отброшено служебных строк: ${state.dropped}` : '',
+            state.orphans ? `несопоставленных ячеек: ${state.orphans}` : '',
+            state.skipped.length ? `страницы без таблицы: ${state.skipped.join(', ')}` : ''].filter(Boolean).join('; ')]);
         log(`${tag}: диапазон ${rng} — НП ${foundAll.size}, дворов: ${fams.length}, людей: ${persons} (${[...hows].join('; ')})`);
         await saveResult(false);
       }
     } catch (e) {
       log('ОШИБКА: ' + (e && e.stack ? e.stack : e));
     } finally {
+      progressShow(true);
+      if (settings.saveScans) {
+        log(`Сканы: сохранено ${scanStats.saved} (${Math.round(scanStats.bytes / 1048576)} МБ), уже были ${scanStats.existed}, ` +
+            `не удалось ${scanStats.failed}. Папка: ${outDir ? `«${outDir.name}/${SCAN_DIR}/»` : linksDir ? `«${linksDir.name}/${SCAN_DIR}/»` : `«Загрузки/${SCAN_DIR}/»`}.`);
+      }
+      const failedPages = debugIndex.filter((x) => x.how === 'ошибка загрузки');
+      if (failedPages.length) {
+        log(`ВНИМАНИЕ: не загружено страниц — ${failedPages.length}: ${failedPages.map((x) => `${x.year ?? '—'} стр. ${x.page}`).join('; ')}. ` +
+            'Данных и сканов по ним нет — запустите их отдельным диапазоном (или повторно через раздел 6).');
+      }
       try { await saveResult(true); } catch (e) { log('Не удалось сохранить: ' + e.message); }
+      if (debugIndex.length) {
+        // run_summary.json пишется последним — признак «пакет готов» для общего скрипта (yaarchive --watch)
+        saveData('run_summary.json', { version: chrome.runtime.getManifest().version, mode: settings.mode, complete: !stopRequested,
+          finished: new Date().toISOString(), outDir: outDir ? outDir.name : '', linksDir: linksDir ? linksDir.name : '',
+          scansDir: settings.saveScans ? SCAN_DIR : '', pages: debugIndex, links: linkRows });
+        log(`Отладочный пакет: ${outLabel()} (страниц: ${debugIndex.length}). Пришлите эту папку на анализ.`);
+      }
       if (workTabId !== null) { chrome.tabs.remove(workTabId).catch(() => {}); workTabId = null; }
       running = false;
       setRunningUi(false);
-      setStatus(`Готово. Дворов: ${families.length}.`);
-      log(`Готово. Дворов: ${families.length}.`);
+      setStatus(`Готово. Дворов: ${families.length}. Результаты: ${outLabel()}`);
+      log(`Готово. Дворов: ${families.length}. Результаты: ${outLabel()}`);
+      saveOut('run_log.txt', new Blob([$('log').textContent], { type: 'text/plain;charset=utf-8' }));
+      try { await writeChain; } catch (e) { /* ошибки уже в журнале */ }
+      if ($('engAuto').checked && debugIndex.length && (outDir || linksDir)) await engineRun(outDir || linksDir, false);
     }
   }
 
-  $('startBtn').addEventListener('click', async () => {
+  // Папка сканов: выбранная вручную, иначе запомненная по умолчанию /Volumes/DATA/Archive_Scans (Chrome не пишет по строке пути —
+  // папку нужно один раз указать в окне выбора, дальше она запоминается).
+  async function ensureScansDir() {
+    if (scanPicked) {
+      if (await dirPermission(scanPicked, true)) return true;
+      log(`Нет доступа к папке сканов «${scanPicked.name}».`);
+      scanPicked = null;
+    }
+    try {
+      const h = await idb((st) => st.get('scansDefault'));
+      if (h && (await dirPermission(h, true))) { scanPicked = h; showNotes(); log(`Папка сканов не выбрана — использую умолчание ${DEFAULT_SCANS_PATH} («${h.name}»).`); return true; }
+    } catch (e) { /* нет запомненной */ }
+    log(`Папка «Archive_Scans» не выбрана: по умолчанию ${DEFAULT_SCANS_PATH}. Укажите её в окне выбора (запомнится).`);
+    const h = await pickDir('yaarchive-scans-default', 'scansDefault');
+    if (h) { scanPicked = h; showNotes(); return true; }
+    log('Папка сканов не указана — сканы пойдут в «Archive_Scans» внутри папки результата.');
+    return false;
+  }
+  // «Начать»: файл и папки выбраны вручную (или подставлены умолчания)
+  async function startRun() {
     if (running || busyPicking) return;
-    if (!items.length) { setStatus('Сначала выберите HTML-файл со ссылками.'); return; }
-    // окно выбора файла должно открываться прямо по клику
+    if (imagesMode()) return startImages();
+    if (!items.length) { setStatus('Сначала выберите файл со ссылками (.html).'); return; }
+    if (!outPicked) { setStatus('Выберите, куда сохранить результат («Выбрать куда сохранить результат»).'); return; }
+    if (settings.saveScans) await ensureScansDir();
+    linksDir = null; outDir = null;
+    if (await dirPermission(outPicked, true)) linksDir = outDir = outPicked;
+    else { setStatus(`Нет доступа к папке «${outPicked.name}» — выберите её заново.`); return; }
+    curQuality = SCAN_QUALITY;
     fileHandle = null;
-    if (window.showSaveFilePicker) {
-      try {
-        fileHandle = await window.showSaveFilePicker({
-          suggestedName: 'result.xlsx',
-          types: [{ description: 'Excel', accept: { [XLSX_MIME]: ['.xlsx'] } }],
-        });
-      } catch (e) {
-        if (e && e.name === 'AbortError') { setStatus('Место сохранения не выбрано.'); return; }
-        log('Окно выбора файла недоступно (' + (e && e.message) + '). Результат будет скачан в «Загрузки».');
+    scanDir = null;
+    scanRel = undefined;
+    log(`Папка результата: «${outDir.name}» — result.xlsx и yaarchive_debug/.`);
+    await run();
+  }
+  $('startBtn').addEventListener('click', () => startRun());
+
+  // «Начать» для образов страниц: результат — в выбранную папку, сканы — в «Archive_Scans», качество — по флажкам
+  async function startImages() {
+    if (!dlPlan || !dlPlan.unique.length) { setStatus('Сначала выберите файл со ссылками (.ged или .html).'); return; }
+    if (!outPicked) { setStatus('Выберите, куда сохранить результат («Выбрать куда сохранить результат»).'); return; }
+    const q = scanQualityId();
+    if (!q) { setStatus('Отметьте качество скана: Оригинальное, Среднее или Низкое.'); return; }
+    curQuality = QUALITY[q].value;
+    await ensureScansDir();
+    if (!(await dirPermission(outPicked, true))) { setStatus(`Нет доступа к папке «${outPicked.name}» — выберите её заново.`); return; }
+    linksDir = null;
+    gedRun = null;
+    if (linksKind === 'ged' && $('gedWrite').checked) {
+      gedRun = { variant: $('gedMedia').checked ? 'media' : 'source', toOrig: $('gedOrig').checked };
+      if (gedRun.toOrig) {
+        let ok = false;
+        try { ok = (await srcFile.queryPermission({ mode: 'readwrite' })) === 'granted' || (await srcFile.requestPermission({ mode: 'readwrite' })) === 'granted'; } catch (e) { /* нет права */ }
+        if (!ok) { setStatus('Нет права записи в исходный .ged — выберите «В копию» или разрешите запись.'); return; }
       }
     }
-    await run();
+    await runDownload(outPicked);
+  }
+
+
+  // ------------------------------------------------------ тип «Скачать графические образы страниц»
+  // Источник: файл .ged или .html (тип определяется по расширению). Все ссылки приводятся к ya.ru/archive/catalog/<дело>/<страница>,
+  // дубликаты удаляются, для каждой страницы сохраняется скан (тот же модуль, что «Сохранить Графические сканы?»).
+  let dlRunPlan = null;      // план текущего запуска
+  let gedRun = null;         // запись в GEDCOM: {variant:'source'|'media', toOrig}
+  let dlMeta = {};           // ссылка страницы -> {cga, scanName, scanFile, scanHref, err}
+
+  async function writeDl(name, blob) {
+    writeChain = writeChain.then(async () => {
+      try {
+        const w = await (await outDir.getFileHandle(name, { create: true })).createWritable();
+        await w.write(blob); await w.close();
+      } catch (e) { log(`Не удалось записать ${name} в «${outDir.name}» (${e.message}).`); }
+    });
+    return writeChain;
+  }
+  async function saveLinksResult(final) {
+    if (!dlRunPlan || !outDir) return;
+    const f = LinksTools.csvFiles(dlRunPlan, dlMeta);
+    await writeDl('result_links.csv', new Blob([f.main], { type: 'text/csv;charset=utf-8' }));
+    await writeDl('result_links_all.csv', new Blob([f.all], { type: 'text/csv;charset=utf-8' }));
+    if (final) log(`Таблица сохранена: «${outDir.name}/» result_links.csv (страниц ${dlRunPlan.unique.length}) и result_links_all.csv (все найденные ссылки). Кодировка UTF-8, разделитель «;».`);
+  }
+
+  // одна страница: скан уже есть -> пропуск без открытия страницы (имя файла известно по пути дела из первой страницы этого дела)
+  async function dlOne(u, crumbsByFile) {
+    const tPage = Date.now();
+    const known = crumbsByFile.get(u.fileId);
+    if (known) {
+      const ci = ExcelSheets.crumbInfo(known, u.page, null, 'https://ya.ru');
+      if (!ci.scanName.startsWith('YA_archive_') && await scanExists(ci.scanName)) {
+        scanStats.existed++;
+        dlMeta[u.clean] = { cga: ci.cga, docType: ci.docType, scanName: ci.scanName, scanFile: `${SCAN_DIR}/${ci.scanName}`, scanLocal: scanLocalFor(ci.scanName), scanHref: scanHrefFor(ci.scanName), err: '' };
+        log(`${u.clean}: скан ${ci.scanName} уже есть — пропущен.`);
+        progressStep(Date.now() - tPage);
+        return false;
+      }
+    }
+    log(`${u.clean}: загружаю страницу...`);
+    const r = await fetchSheet(u.fileId, u.page);
+    if (!r.nextNode || !r.nextNode.id) {
+      dlMeta[u.clean] = { err: r.err || 'нет данных страницы (не найден код скана)' };
+      log(`  ВНИМАНИЕ: ${u.clean} не загружена: ${dlMeta[u.clean].err}`);
+      progressStep(Date.now() - tPage);
+      return true;
+    }
+    crumbsByFile.set(u.fileId, r.nextNode.crumbs);
+    noteMeta(r, u.page);
+    const scanMs = await saveScan(r, u.page);
+    const m = pageMeta[r.url] || {};
+    dlMeta[u.clean] = { cga: m.cga || '', docType: m.docType || '', scanName: m.scanName || '', scanFile: m.scanFile || '', scanLocal: m.scanLocal || '', scanHref: m.scanHref || '',
+      err: m.scanFile ? '' : (m.scanErr || 'скан не сохранён') };
+    progressStep(Date.now() - tPage);
+    await sleep(Math.max(0, rand(CFG.DELAY) - scanMs));
+    return true;
+  }
+
+  // навык «Запись в GEDCOM»: ссылки на сохранённые сканы -> в .ged (копия или исходный файл с копией «до сканов»)
+  async function writeGedcom(dir, plan) {
+    const name = srcFile.name.replace(/\.ged$/i, '');
+    try {
+      const r = GedcomWriter.apply(linksText, plan, dlMeta, gedRun.variant);
+      const st = r.stats;
+      if (!st.pages) { log(`GEDCOM: записывать нечего — сканов с персонами нет (без скана ${st.noScan}, без персоны ${st.noPerson}).`); return; }
+      const put = async (handle, blob) => { const w = await handle.createWritable(); await w.write(blob); await w.close(); };
+      const bytes = new TextEncoder().encode(r.text);
+      if (gedRun.toOrig) {
+        const f = await srcFile.getFile();
+        await put(await dir.getFileHandle(`${name}_до_сканов.ged`, { create: true }), f);
+        await put(srcFile, new Blob([bytes], { type: 'text/plain' }));
+        log(`GEDCOM: записано в исходный файл «${srcFile.name}»; прежний сохранён: «${dir.name}/${name}_до_сканов.ged».`);
+      } else {
+        await put(await dir.getFileHandle(`${name}_со_сканами.ged`, { create: true }), new Blob([bytes], { type: 'text/plain' }));
+        log(`GEDCOM: записано в «${dir.name}/${name}_со_сканами.ged».`);
+      }
+      log(`GEDCOM (${gedRun.variant === 'media' ? 'общий медиа-объект' : 'источник'}): страниц ${st.pages}, ссылок у персон ${st.links}, персон ${st.persons}; ` +
+        `без скана ${st.noScan}, без персоны ${st.noPerson}; записей этой страницы уже было у персоны: другим вариантом записано ${st.switched}, пропущено ${st.exists}${st.removed ? `; прежних записей навыка заменено ${st.removed}` : ''}. Кодировка файла — UTF-8.`);
+    } catch (e) { log('GEDCOM: не удалось записать — ' + (e && e.message)); }
+  }
+
+  async function runDownload(dir) {
+    running = true; stopRequested = false; dlMode = true;
+    outDir = dir; fileHandle = null; debugSaved = true;
+    pageMeta = {}; dlMeta = {}; scanDir = null; scanRel = undefined;
+    scanStats = { saved: 0, existed: 0, failed: 0, bytes: 0 };
+    const plan = dlRunPlan = dlPlan;
+    setRunningUi(true);
+    progressStart(plan.unique.length);
+    log(`Образы страниц: уникальных страниц ${plan.unique.length} из ссылок ${plan.entries.length}. Папка: «${dir.name}». Качество скана: ${QUALITY[scanQualityId()] ? QUALITY[scanQualityId()].label + ' ' + QUALITY[scanQualityId()].percent + '%' : '—'}.`);
+    try {
+      const cur = await chrome.tabs.getCurrent();
+      appTabId = cur ? cur.id : null;
+      await writeDl('list_links_fixed.html', new Blob([LinksTools.fixedHtml(plan)], { type: 'text/html;charset=utf-8' }));
+      await saveLinksResult(false);                       // таблица всех найденных ссылок готова сразу
+      await ensureLogin();
+      const crumbs = new Map();
+      let n = 0;
+      for (const u of plan.unique) {
+        if (stopRequested) break;
+        setStatus(`Образы страниц: ${++n} из ${plan.unique.length}`);
+        if (await dlOne(u, crumbs) && n % 10 === 0) await saveLinksResult(false);
+      }
+      // второй проход по страницам, которые не загрузились
+      const bad = plan.unique.filter((u) => dlMeta[u.clean] && dlMeta[u.clean].err);
+      if (bad.length && !stopRequested) {
+        log(`Повторная попытка для страниц, которые не удалось скачать: ${bad.length}.`);
+        progress.total += bad.length; progressShow();
+        for (const u of bad) { if (stopRequested) break; await sleep(2000); await dlOne(u, crumbs); }
+      }
+    } catch (e) {
+      log('ОШИБКА: ' + (e && e.stack ? e.stack : e));
+    } finally {
+      progressShow(true);
+      const bad = plan.unique.filter((u) => !dlMeta[u.clean] || dlMeta[u.clean].err);
+      log(`Сканы: сохранено ${scanStats.saved} (${Math.round(scanStats.bytes / 1048576)} МБ), уже были ${scanStats.existed}, не удалось ${scanStats.failed}. Папка: «${scanDir ? scanDir.name : dir.name + '/' + SCAN_DIR}».`);
+      if (bad.length) log(`ВНИМАНИЕ: без скана осталось ${bad.length}: ${bad.map((u) => u.clean).join('; ')}`);
+      try { await saveLinksResult(true); } catch (e) { log('Не удалось сохранить Excel: ' + e.message); }
+      if (gedRun) await writeGedcom(dir, plan);
+      if (workTabId !== null) { chrome.tabs.remove(workTabId).catch(() => {}); workTabId = null; }
+      const done = plan.unique.length - bad.length;
+      running = false; dlMode = false;
+      setRunningUi(false);
+      setStatus(`Готово. Образов страниц: ${done} из ${plan.unique.length}${stopRequested ? ' (остановлено)' : ''}. Папка: «${dir.name}».`);
+      log(`Готово. Образов страниц: ${done} из ${plan.unique.length}.`);
+      await writeDl('links_run_log.txt', new Blob([$('log').textContent], { type: 'text/plain;charset=utf-8' }));
+      try { await writeChain; } catch (e) { /* ошибки уже в журнале */ }
+    }
+  }
+
+  // ------------------------------------------------------------- итоговая обработка (общий скрипт yaarchive, встроен в расширение)
+  let engWorker = null, engSeq = 0, engBusy = false, engProps = [];
+  const engPending = new Map();
+  function engineCall(msg, transfer) {
+    return new Promise((resolve, reject) => {
+      if (!engWorker) {
+        engWorker = new Worker('engine-worker.js');
+        engWorker.onmessage = (ev) => {
+          const m = ev.data;
+          if (m.type === 'log') { log('  ' + m.text); return; }
+          const p = engPending.get(m.id);
+          if (!p) return;
+          engPending.delete(m.id);
+          if (m.type === 'error') p.reject(new Error(m.message)); else p.resolve(m);
+        };
+        engWorker.onerror = (e) => { for (const p of engPending.values()) p.reject(new Error(e.message || 'ошибка воркера')); engPending.clear(); };
+      }
+      const id = ++engSeq;
+      engPending.set(id, { resolve, reject });
+      engWorker.postMessage({ ...msg, id }, transfer || []);
+    });
+  }
+  async function readAll(dirH, rel, out, pick) {
+    for await (const [name, h] of dirH.entries()) {
+      const r = rel ? rel + '/' + name : name;
+      if (h.kind === 'directory') await readAll(h, r, out, pick);
+      else if (pick(r)) out.push({ path: r, data: await (await h.getFile()).arrayBuffer() });
+    }
+  }
+  // что нужно движку из папки результата: данные страниц пакетов, итоговые файлы прошлого запуска и свои справочники
+  async function engineInputs(dir) {
+    const files = [];
+    try { const f = await (await dir.getFileHandle('справочники.json')).getFile(); files.push({ path: 'справочники.json', data: await f.arrayBuffer() }); } catch (e) { /* нет */ }
+    try {
+      const dbg = await dir.getDirectoryHandle('yaarchive_debug');
+      await readAll(dbg, 'yaarchive_debug', files, (r) => /_next_data\.json$|\/run_summary\.json$/.test(r));
+    } catch (e) { /* пакетов нет */ }
+    try { await readAll(await dir.getDirectoryHandle('Итог'), 'Итог', files, () => true); } catch (e) { /* первый запуск */ }
+    return files;
+  }
+  async function writeFileAt(dir, path, data) {
+    const parts = path.split('/');
+    let d = dir;
+    for (const p of parts.slice(0, -1)) d = await d.getDirectoryHandle(p, { create: true });
+    const w = await (await d.getFileHandle(parts[parts.length - 1], { create: true })).createWritable();
+    await w.write(data);
+    await w.close();
+  }
+  // имена сканов из «Archive_Scans» (для ссылок на сканы в итоге); без папки — ссылок на сканы нет
+  async function engineScanNames(ask) {
+    let h = scanDir || null;
+    if (!h && scanPicked && (await dirPermission(scanPicked, ask))) {
+      h = scanPicked.name === SCAN_DIR ? scanPicked : await scanPicked.getDirectoryHandle(SCAN_DIR).catch(() => scanPicked);
+    }
+    if (!h) { try { const d = await idb((st) => st.get('scansDefault')); if (d && (await dirPermission(d, ask))) h = d; } catch (e) { /* нет */ } }
+    if (!h) return null;
+    const base = scanAbs(), names = {};
+    for await (const [name, e] of h.entries()) if (e.kind === 'file' && /\.jpe?g$/i.test(name)) names[name] = base + '/' + name;
+    return names;
+  }
+  async function engineRun(dir, ask) {
+    if (engBusy) return;
+    engBusy = true;
+    $('engBtn').disabled = true;
+    $('engNote').textContent = 'Итоговая обработка… (первый запуск загружает движок, до минуты)';
+    try {
+      log('Итоговая обработка (общий скрипт yaarchive, встроен в расширение)…');
+      const files = await engineInputs(dir);
+      const scanNames = await engineScanNames(ask);
+      const m = await engineCall({ cmd: 'run', files, scanNames, scansPublic: scanAbs() }, files.map((f) => f.data));
+      await engineFinish(dir, m);
+    } catch (e) {
+      log('ОШИБКА итоговой обработки: ' + (e && e.message ? e.message : e));
+      $('engNote').textContent = 'Итоговая обработка не выполнена: ' + (e && e.message ? e.message : e);
+    } finally { engBusy = false; $('engBtn').disabled = false; }
+  }
+  async function engineFinish(dir, m) {
+    for (const f of m.files) await writeFileAt(dir, f.path, f.data);
+    const r = m.result;
+    engProps = r.proposals || [];
+    $('engNote').textContent = r.pages ? `Готово: людей ${r.people}, документов ${r.docs}, семей в GEDCOM ${r.fams}. Файлы — в «${dir.name}/Итог/».`
+      : 'Пакетов с данными страниц в этой папке нет — сначала выполните обработку.';
+    log(r.pages ? `Итог записан в «${dir.name}/Итог/»: ${r.files.join(', ')}.` : 'Итоговая обработка: пакетов с данными нет.');
+    showProposals();
+  }
+  function showProposals() {
+    const list = $('fixList');
+    list.textContent = '';
+    $('fixBox').hidden = !engProps.length;
+    $('fixCount').textContent = engProps.length ? `— ${engProps.length}` : '';
+    for (const p of engProps) {
+      const d = document.createElement('div');
+      d.className = 'fix'; d.dataset.id = p.id;
+      const t = document.createElement('div'); t.className = 't'; t.textContent = `${p.type} — ${p.where || ''}`;
+      const c = document.createElement('div'); c.textContent = `${p.now == null ? '' : p.now} → ${p.new == null ? '' : p.new}${p.reason ? ' · ' + p.reason : ''}`;
+      const s = document.createElement('select');
+      [['', 'пропустить'], ['да', 'да — исправить'], ['нет', 'нет — больше не предлагать']].forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; s.appendChild(o); });
+      d.append(t, c);
+      if (p.url) { const a = document.createElement('a'); a.href = p.url; a.target = '_blank'; a.rel = 'noreferrer'; a.textContent = 'страница в Яндекс Архиве'; d.append(a, document.createElement('br')); }
+      d.append(s);
+      list.appendChild(d);
+    }
+  }
+  async function engineApply() {
+    const dir = outDir || outPicked;
+    const decisions = [...document.querySelectorAll('#fixList .fix')].map((d) => ({ id: d.dataset.id, decision: d.querySelector('select').value })).filter((x) => x.decision);
+    if (!decisions.length) { $('engNote').textContent = 'Выберите «да» или «нет» хотя бы для одного предложения.'; return; }
+    if (!dir || engBusy) return;
+    engBusy = true; $('fixApply').disabled = true;
+    try {
+      const m = await engineCall({ cmd: 'decide', decisions, scanNames: await engineScanNames(true), scansPublic: scanAbs() });
+      await engineFinish(dir, m);
+    } catch (e) { log('ОШИБКА применения решений: ' + (e && e.message ? e.message : e)); $('engNote').textContent = 'Решения не применены: ' + e.message; }
+    finally { engBusy = false; $('fixApply').disabled = false; }
+  }
+  $('engBtn').addEventListener('click', async () => {
+    if (running) return;
+    if (!outPicked) { $('engNote').textContent = 'Выберите, куда сохранить результат («Выбрать куда сохранить результат»).'; return; }
+    if (!(await dirPermission(outPicked, true))) { $('engNote').textContent = `Нет доступа к папке «${outPicked.name}».`; return; }
+    await engineRun(outPicked, true);
   });
+  $('fixApply').addEventListener('click', engineApply);
+  const fixAll = (v) => document.querySelectorAll('#fixList select').forEach((s) => { s.value = v; });
+  $('fixYes').addEventListener('click', () => fixAll('да'));
+  $('fixNo').addEventListener('click', () => fixAll('нет'));
+  $('fixSkip').addEventListener('click', () => fixAll(''));
 
   // ------------------------------------------------------------- старт
   (async () => {
     await loadSettings();
     applyModeUi();
     showSelectors();
+    ['useDefaults', 'qOrig', 'qMid', 'qLow', 'saveScans', 'showTab', 'gedWrite', 'gedOrig'].forEach((id) => { $(id).checked = false; });
     try { const cur = await chrome.tabs.getCurrent(); appTabId = cur ? cur.id : null; } catch (e) { /* ignore */ }
+    // флажки и выбор файла/папок при запуске сброшены: всё выбирается вручную (или флажком «Использовать умолчания»)
+    showNotes();
   })();
 })();

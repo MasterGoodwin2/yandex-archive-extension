@@ -13,6 +13,53 @@
     const dateSel = opts.dateSel || '';
     const maxWait = opts.maxWait || 15000;
 
+
+    // ---- данные страницы (__NEXT_DATA__): готовые блоки с координатами и текстом ----
+    // Тег есть в странице при обычной загрузке по адресу; номер страницы сверяется с адресом.
+    // Если тега нет или он от другой страницы — тот же адрес запрашивается с вашей сессией.
+    const wantPage = (() => { const m = location.pathname.match(/\/catalog\/[^/]+\/(\d+)\/?$/); return m ? parseInt(m[1], 10) : null; })();
+    const nodeOf = (data) => {
+      if (!data) return null;
+      const props = data.props && data.props.pageProps ? data.props.pageProps : data;
+      const n = props.currentNode || null;
+      if (!n || !Array.isArray(n.textBlocks) || !Array.isArray(n.joinedTextBlocks)) return null;
+      const dn = parseInt(props.docNumber !== undefined ? props.docNumber : (data.query || {}).docNumber, 10);
+      if (wantPage !== null && !Number.isNaN(dn) && dn !== wantPage) return null;
+      return { id: n.id, sheetPageNumber: n.sheetPageNumber, originalImageSize: n.originalImageSize,
+        joinedTextBlocks: n.joinedTextBlocks, textBlocks: n.textBlocks,
+        // путь «ЦГА Москвы / Фонд / Опись / Дело» (breadcrumbs) — для ссылки на архив и имени файла скана
+        crumbs: (props.breadcrumbs || []).map((c) => ({ type: c.type, id: c.id, code: c.code, name: c.name })) };
+    };
+    const getNext = async () => {
+      try {
+        const el = document.getElementById('__NEXT_DATA__');
+        if (el) { const n = nodeOf(JSON.parse(el.textContent)); if (n) return { node: n, how: 'тег страницы' }; }
+      } catch (e) { /* пробуем запрос */ }
+      try {
+        const r = await fetch(location.href, { credentials: 'include' });
+        const m = (await r.text()).match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+        if (m) { const n = nodeOf(JSON.parse(m[1])); if (n) return { node: n, how: 'запрос страницы' }; }
+      } catch (e) { /* нет данных */ }
+      return null;
+    };
+
+    if (opts.useNext) {
+      const nx = await getNext();
+      if (!nx && opts.nextOnly) return { found: false, text: '', date: '', nextNode: null, origin: location.origin };
+      if (nx) {
+        if (opts.nextOnly) {      // образы страниц: нужны только код скана и путь дела (ссылки), блоки текста не разбираются
+          return { found: true, text: '', textHow: '', date: '', dateHow: '', textBlocks: [], overlayBlocks: [],
+            nextNode: { id: nx.node.id, crumbs: nx.node.crumbs, joinedTextBlocks: [], textBlocks: [] }, nextHow: nx.how, origin: location.origin, html: null, debug: null };
+        }
+        const tbText = nx.node.textBlocks.map((t) => String(t.text || '').trim()).filter(Boolean).join('\n');
+        return {
+          found: true, text: tbText, textHow: 'данные страницы (' + nx.how + ')', date: '', dateHow: '',
+          textBlocks: [], overlayBlocks: [], nextNode: nx.node, nextHow: nx.how, origin: location.origin,
+          html: opts.wantHtml ? document.documentElement.outerHTML : null, debug: null,
+        };
+      }
+    }
+
     const rectOf = (e) => e.getBoundingClientRect();
     const visible = (e) => {
       const cs = getComputedStyle(e);
@@ -217,6 +264,48 @@
   }
 
   // ----------------------------------------------------------------------------
+  // Оригинал скана текущей страницы (по логике Scrpt_YA_Orig_Scan, MIT, github.com/MasterGoodwin2/Scrpt_YA_Orig_Scan):
+  // POST /archive/api/image-grant {nodeId, type:'original'} -> {url, token}; файл — с заголовком X-Archive-Image-Token.
+  // Пересжатие в JPG с качеством quality (0.4 = 40%), размеры в пикселях не меняются; если не удалось — оригинал.
+  // Возвращает {ok, b64, size, origSize, w, h, recompressed, err}.
+  // ----------------------------------------------------------------------------
+  async function scanFetcher(nodeId, quality) {
+    const MIN_BYTES = 20000;
+    try {
+      const g = await fetch('/archive/api/image-grant', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+        body: JSON.stringify({ nodeId, type: 'original' }),
+      });
+      if (!g.ok) return { ok: false, err: 'image-grant: HTTP ' + g.status };
+      const grant = await g.json();
+      if (!grant || !grant.url || !grant.token) return { ok: false, err: 'image-grant: некорректный ответ' };
+      const r = await fetch(new URL(grant.url, location.origin).href, { headers: { 'X-Archive-Image-Token': grant.token }, credentials: 'include' });
+      if (!r.ok) return { ok: false, err: 'оригинал: HTTP ' + r.status };
+      const ct = String(r.headers.get('content-type') || '').toLowerCase();
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      if (ct && ct.indexOf('image/') !== 0) return { ok: false, err: 'сервер вернул не изображение (' + ct + ')' };
+      if (bytes.length < MIN_BYTES) return { ok: false, err: 'слишком маленький файл (' + bytes.length + ' байт), вероятно превью' };
+      let out = bytes, w = 0, h = 0, recompressed = false;
+      const q = typeof quality === 'number' && quality > 0 ? Math.min(quality, 1) : 0.4;
+      if (q < 1) try {
+        const bmp = await createImageBitmap(new Blob([bytes]));
+        w = bmp.width; h = bmp.height;
+        const c = new OffscreenCanvas(w, h);
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); ctx.drawImage(bmp, 0, 0);
+        if (bmp.close) bmp.close();
+        const blob = await c.convertToBlob({ type: 'image/jpeg', quality: typeof quality === 'number' && quality > 0 ? Math.min(quality, 1) : 0.4 });
+        if (blob && blob.size > 1000 && blob.size < bytes.length) { out = new Uint8Array(await blob.arrayBuffer()); recompressed = true; }
+      } catch (e) { /* сохраняем оригинал */ }
+      let bin = '';
+      for (let i = 0; i < out.length; i += 0x8000) bin += String.fromCharCode.apply(null, out.subarray(i, i + 0x8000));
+      return { ok: true, b64: btoa(bin), size: out.length, origSize: bytes.length, w, h, recompressed };
+    } catch (e) {
+      return { ok: false, err: e && e.message ? e.message : String(e) };
+    }
+  }
+
+  // ----------------------------------------------------------------------------
   // Выбор элемента мышью (калибровка). Возвращает Promise с {selector,count,sample} или null.
   // Мышь — подсветка, ↑ — выбрать родителя, ↓ — вернуться к вложенному, клик — выбрать, Esc — отмена.
   // ----------------------------------------------------------------------------
@@ -314,7 +403,7 @@
     });
   }
 
-  const api = { pageExtractor, pickerRun };
+  const api = { pageExtractor, pickerRun, scanFetcher };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PageScripts = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

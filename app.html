@@ -11,6 +11,9 @@
     .muted { color: #777; font-size: 13px; }
     fieldset { border: 1px solid #8884; border-radius: 8px; margin: 16px 0; padding: 12px 16px; }
     legend { padding: 0 6px; font-weight: 600; }
+    body { counter-reset: sec; }
+    fieldset:not([hidden]) > legend::before { counter-increment: sec; content: counter(sec) ". "; }
+    [hidden] { display: none !important; }
     label { display: block; margin: 6px 0; }
     label.mode { padding: 8px 10px; border: 1px solid #8884; border-radius: 8px; }
     label.mode input { margin-right: 8px; }
@@ -18,10 +21,28 @@
     button { font: inherit; padding: 7px 16px; border-radius: 6px; border: 1px solid #8886; cursor: pointer; background: #8881; }
     button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
     button:disabled { opacity: .45; cursor: default; }
+    .note { color: #2563eb; font-size: 13px; margin: 4px 0; word-break: break-all; }
+    @media (prefers-color-scheme: dark) { .note { color: #7aa7ff; } }
+    input[type=text] { font: inherit; padding: 4px 8px; width: 100%; box-sizing: border-box; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
     code { font: 12.5px ui-monospace, Menlo, monospace; word-break: break-all; }
     #banner { display: none; border: 1px solid #d97706; background: #f59e0b22; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+    #fixList .fix { border: 1px solid #8884; border-radius: 6px; padding: 6px 10px; margin: 6px 0; font-size: 13px; }
+    #fixList .fix select { font: inherit; margin-top: 4px; }
+    #fixList .fix .t { font-weight: 600; }
     #status { font-weight: 600; margin: 12px 0 4px; }
+    .toggle { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; margin: 8px 0; }
+    .toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .toggle .track { position: relative; width: 46px; height: 24px; border-radius: 12px; background: #2563eb; transition: background .15s; flex: none; }
+    .toggle .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: left .15s; }
+    .toggle input:checked + .side + .track::after { left: 25px; }
+    .toggle input:checked + .side + .track { background: #059669; }
+    .toggle .side { font-weight: 400; color: #888; }
+    .toggle input:not(:checked) ~ .side.left, .toggle input:checked ~ .side.right { font-weight: 700; color: inherit; }
+    .toggle input:focus-visible ~ .track { outline: 2px solid #2563eb; outline-offset: 2px; }
+    #progressBox { display: none; margin: 12px 0 4px; }
+    #progressBar { width: 100%; height: 14px; }
+    #progressText { font-size: 13px; margin-top: 2px; font-variant-numeric: tabular-nums; }
     #log { white-space: pre-wrap; font: 12.5px/1.45 ui-monospace, Menlo, monospace; border: 1px solid #8884; border-radius: 8px; padding: 10px; height: 300px; overflow: auto; }
   </style>
 </head>
@@ -29,27 +50,82 @@
   <h1>Яндекс Архив — сбор людей округи</h1>
   <div class="muted">Перед запуском войдите в Яндекс в этом же Chrome (откройте ya.ru/archive). Эту вкладку не закрывайте, пока идёт работа.</div>
 
+  <label><input type="checkbox" id="useDefaults"> <b>Использовать умолчания</b> — взять файл и папки, выбранные в прошлый раз
+    (без флажка файл и папки выбираются вручную при каждом запуске)</label>
   <fieldset>
-    <legend>1. Тип обработки данных</legend>
+    <legend>Тип обработки данных</legend>
     <label class="mode"><input type="radio" name="mode" value="confession" checked>
       <b>Исповедные ведомости</b><span class="muted" id="descConfession"></span></label>
     <label class="mode"><input type="radio" name="mode" value="revision">
       <b>Ревизские сказки</b><span class="muted" id="descRevision"></span></label>
+    <label class="mode"><input type="radio" name="mode" value="images">
+      <b>Скачать графические образы страниц из списка ссылок</b><span class="muted" id="descImages"></span></label>
   </fieldset>
 
   <fieldset>
-    <legend>2. Список ссылок</legend>
-    <input type="file" id="linksFile" accept=".html,.htm,text/html">
-    <div class="muted" id="linksInfo">Файл list_links.html не выбран</div>
+    <legend>Откуда взять ссылки</legend>
+    <div class="row">
+      <button id="pickFileBtn" class="primary">Выбрать файл со ссылками (.html или .ged)</button>
+    </div>
+    <div class="note" id="srcNote">Файл не выбран</div>
+    <div class="muted" id="linksInfo"></div>
+    <div class="muted" data-only="images">Диапазоны не раскрываются и не вычисляются: из каждой ссылки берётся только та страница, на которую она указывает (в ссылке поиска «от…до» — страница из <code>sheet_page_from</code>; в сообщении об этом остаётся пометка). Слипшиеся ссылки («…/7; …/278; …/242;» или без пробелов) делятся на отдельные, каждая записывается той персоне, из чьих данных взята.</div>
+    <div class="muted" data-only="images">Файл .ged (генеалогический проект) или .html (список ссылок): тип файла определяется по расширению.</div>
+  </fieldset>
+
+  <fieldset id="gedBox" hidden>
+    <legend>Запись сканов в GEDCOM</legend>
+    <label><input type="checkbox" id="gedWrite"> <b>Записать ссылки на сканы в GEDCOM-файл</b> (навык «Запись в GEDCOM»)</label>
+    <div class="muted">После скачивания у каждой персоны, к которой относилась ссылка, появится ссылка на локальный скан (JPG), название документа с годом и архив хранения.</div>
+    <div id="gedOpts" style="margin-top:8px">
+      <div><b>Как записать:</b></div>
+      <label><input type="radio" name="gedVariant" id="gedSource" value="source" checked> <b>Источник</b> — запись SOUR (название и год документа, архив хранения, ссылка на страницу, файл скана) и у персоны ссылка на неё. Самый правильный для генеалогии вариант.</label>
+      <label><input type="radio" name="gedVariant" id="gedMedia" value="media"> <b>Общий медиа-объект</b> — запись OBJE (файл скана, название, описание) и у персоны ссылка на неё. Страница на нескольких людей = один объект, без повторов.</label>
+      <div style="margin-top:8px"><b>Куда записать:</b></div>
+      <label><input type="radio" name="gedTarget" id="gedCopy" value="copy" checked> В копию <code>&lt;имя&gt;_со_сканами.ged</code> в папке результата (исходный файл не меняется)</label>
+      <label><input type="radio" name="gedTarget" id="gedOrig" value="orig"> Прямо в исходный файл (перед этим рядом сохраняется копия <code>&lt;имя&gt;_до_сканов.ged</code>)</label>
+    </div>
+    <div class="note" id="gedNote">Запись в GEDCOM не включена</div>
   </fieldset>
 
   <fieldset>
-    <legend>3. Откуда брать данные на странице</legend>
+    <legend>Куда сохранить</legend>
+    <div class="row">
+      <button id="pickOutBtn" class="primary">Выбрать куда сохранить результат</button>
+    </div>
+    <div class="note" id="outNote">Папка результата не выбрана</div>
+    <div class="muted" data-only="confession revision">В выбранную папку пишутся result.xlsx, журнал и отладочный пакет «yaarchive_debug/&lt;время запуска&gt;/».</div>
+    <div class="muted" data-only="images">В выбранную папку пишутся <code>result_links.csv</code> (UTF-8, разделитель «;»), <code>result_links_all.csv</code>, <code>list_links_fixed.html</code> и журнал.</div>
+    <div id="scanWrap">
+      <div class="row">
+        <button id="pickScanBtn">Выбрать папку «Archive_Scans» для сканов</button>
+      </div>
+      <div class="note" id="scanNote">Папка сканов не выбрана — по умолчанию /Volumes/DATA/Archive_Scans/</div>
+      <label>Локальный путь к папке «Archive_Scans» (в столбце «Локальная Ссылка на страницу» — этот путь + имя файла графического образа):
+        <input type="text" id="scanPath" value="/Volumes/DATA/Archive_Scans" spellcheck="false"></label>
+      <div class="muted">Если файл скана уже существует, он пропускается. Браузер не может писать по строке пути, поэтому
+        при первом запуске без выбранной папки расширение попросит указать /Volumes/DATA/Archive_Scans в окне выбора и запомнит её.</div>
+    </div>
+  </fieldset>
+
+  <fieldset data-only="images">
+    <legend>Качество скана</legend>
+    <label><input type="checkbox" id="qOrig" name="q"> <b>Оригинальное</b> — 100% (без пересжатия)</label>
+    <label><input type="checkbox" id="qMid" name="q"> <b>Среднее</b> — 50%</label>
+    <label><input type="checkbox" id="qLow" name="q"> <b>Низкое</b> — 20%</label>
+    <div class="note" id="qNote">Качество не выбрано</div>
+    <div class="muted">Уровни качества определены в навыке «Сохранить Скан» (Scrpt_YA_Orig_Scan). Размер в пикселях не меняется.</div>
+  </fieldset>
+
+  <fieldset data-only="confession revision">
+    <legend>Откуда брать данные на странице</legend>
     <div class="muted">
       Текст берётся только из окна расшифрованного (распознанного) текста — справа от окна со сканом.
       Дата документа — строка выше панели инструментов окна со сканом. По умолчанию окна определяются автоматически;
       если определились неверно, укажите их вручную: расширение откроет первую страницу из вашего списка,
       вы наведёте мышь на нужное место и кликните.
+      <br><b>Ревизские сказки и исповедные ведомости:</b> пока страница отдаёт готовые данные (тег __NEXT_DATA__), текст и координаты
+      берутся из них, настройки этого раздела не нужны. Окна страницы используются только как запасной путь.
     </div>
     <div style="margin-top:8px">Окно текста: <code id="textSelInfo">автоопределение</code></div>
     <div>Строка даты: <code id="dateSelInfo">автоопределение</code></div>
@@ -60,14 +136,49 @@
     </div>
   </fieldset>
 
+  <fieldset data-only="confession revision">
+    <legend>Результат в Excel</legend>
+    <div>В каком виде выдать результаты (не зависит от типа обработки в разделе 1):</div>
+    <label class="toggle" title="Переключить вид файла результатов">
+      <input type="checkbox" id="outFormat" role="switch" aria-label="Вид результата: исповедные ведомости или ревизские сказки">
+      <span class="side left">Исповедные ведомости</span>
+      <span class="track" aria-hidden="true"></span>
+      <span class="side right">Ревизские сказки</span>
+    </label>
+    <div class="muted" id="outFormatInfo"></div>
+    <label style="margin-top:10px"><input type="checkbox" id="saveScans"> <b>Сохранить Графические сканы?</b> — применить навык «Сохранить Скан» (Scrpt_YA_Orig_Scan)</label>
+    <div class="muted">Оригинал скана каждой страницы (JPG, качество 40%, размер в пикселях как у оригинала) сохраняется в папку
+      «Archive_Scans» (раздел «Куда сохранить»). В Excel — столбец «Локальная Ссылка на страницу».</div>
+  </fieldset>
+
+  <fieldset data-only="confession revision">
+    <legend>Итоговая обработка (общий скрипт yaarchive)</legend>
+    <label><input type="checkbox" id="engAuto" checked> <b>После запуска выполнить итоговую обработку</b> — единая таблица людей, родство, дворы, годы рождения, GEDCOM и предложения исправлений</label>
+    <div class="muted">Общий скрипт yaarchive встроен в расширение и работает внутри него (Python в WebAssembly): Терминал и установка Python не нужны.
+      В папке результата создаётся «Итог/»: <code>Итог_люди.xlsx</code>, <code>Итог_древо.ged</code>, <code>Итог_люди.json</code>, <code>Отчёт.txt</code>. Навык «Исправление ошибок» предлагает правки — решения принимаются в окне ниже.</div>
+    <div class="row">
+      <button id="engBtn">Выполнить итоговую обработку папки результата сейчас</button>
+    </div>
+    <div class="note" id="engNote"></div>
+    <div id="fixBox" hidden>
+      <div><b>Предложения исправлений</b> <span class="muted" id="fixCount"></span></div>
+      <div class="row" style="margin-top:4px">
+        <button id="fixYes">Да — всем</button><button id="fixNo">Нет — всем</button><button id="fixSkip">Сбросить выбор</button>
+        <button id="fixApply" class="primary">Применить решения</button>
+      </div>
+      <div id="fixList"></div>
+    </div>
+  </fieldset>
+
   <fieldset>
-    <legend>4. Настройки</legend>
+    <legend>Настройки</legend>
     <label><input type="checkbox" id="showTab"> Показывать рабочую вкладку (если страницы не успевают прогружаться в фоне)</label>
-    <label><input type="checkbox" id="debugHtml" checked> Сохранить отладочные файлы первой страницы (first_page.html и first_page_debug.json) — нужны для настройки сопоставления блоков</label>
+    <label data-only="confession revision"><input type="checkbox" id="debugHtml" checked> Сохранить отладочные файлы первой страницы (first_page.html, first_page_debug.json, first_page_next_data.json)</label>
+    <label data-only="confession revision"><input type="checkbox" id="debugAll" checked> Сохранять дополнительные отладочные файлы (результат привязки столбцов по каждой странице). Данные страниц и run_summary.json для общего скрипта yaarchive сохраняются всегда.</label>
   </fieldset>
 
   <div class="row">
-    <button id="startBtn" class="primary">Выбрать, куда сохранить Excel, и начать</button>
+    <button id="startBtn" class="primary">Начать</button>
     <button id="saveBtn" disabled>Сохранить сейчас</button>
     <button id="stopBtn" disabled>Остановить и сохранить</button>
   </div>
@@ -77,11 +188,21 @@
     <div class="row"><button id="continueBtn">Продолжить</button></div>
   </div>
 
+  <div id="progressBox">
+    <progress id="progressBar" value="0" max="1"></progress>
+    <div id="progressText"></div>
+  </div>
   <div id="status">Готов к запуску.</div>
   <div id="log"></div>
 
   <script src="xlsx-writer.js"></script>
+  <script src="excel-sheets.js"></script>
   <script src="logic.js"></script>
+  <script src="links-tools.js"></script>
+  <script src="gedcom-writer.js"></script>
+  <script src="revision-rows.js"></script>
+  <script src="names-ru.js"></script>
+  <script src="confession-rows.js"></script>
   <script src="layout.js"></script>
   <script src="page-scripts.js"></script>
   <script src="app.js"></script>

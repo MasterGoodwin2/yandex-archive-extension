@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Яндекс Архив — сбор людей округи",
-  "version": "1.3.0",
+  "version": "3.0.1",
   "description": "Собирает данные о людях округи из исповедных ведомостей и ревизских сказок Яндекс Архива по списку ссылок и сохраняет их в Excel.",
   "minimum_chrome_version": "120",
   "action": {
@@ -10,7 +10,15 @@
   "background": {
     "service_worker": "background.js"
   },
-  "permissions": ["tabs", "scripting", "storage"],
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "downloads"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "host_permissions": [
     "https://ya.ru/*",
     "https://yandex.ru/*"

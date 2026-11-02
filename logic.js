@@ -15,8 +15,9 @@
       minLineLen: 3,              // для запасного построчного режима
       defaultSpan: 15,            // если в ссылке нет sheet_page_to: from .. from+defaultSpan
       description:
-        'Заголовки: село / деревня. Одна строка Excel = один двор (семья); все люди двора — в одной ячейке: ' +
-        '№ мужчины / женщины, текст как распознан, возраст.',
+        'Заголовки: село / деревня (в т.ч. «Того села»). Одна строка Excel = один человек: его часть текста Основного блока ' +
+        '(как распознана), пол, номер (м№/ж№), возраст и год рождения (год ведомости − возраст). Двор — № из левого столбца. ' +
+        '«Показанія дѣйства» не собираются. Лист «Блоки текста» — блоки целиком для проверки деления.',
     },
     revision: {
       id: 'revision',
@@ -25,8 +26,9 @@
       minLineLen: 3,
       defaultSpan: 15,
       description:
-        'Заголовки: также починок, выселок, слобода, хутор и т. п. Одна строка Excel = один двор (семья); ' +
-        'все люди двора — в одной ячейке: № мужчины / женщины, текст как распознан, возраст.',
+        'Заголовки: также починок, выселок, слобода, хутор и т. п. Одна строка Excel = один двор (семья). ' +
+        'Данные берутся из готовой разметки страницы: список людей блока «Крестьяне/Крестьянки» как распознан, ' +
+        'а рядом по строкам таблицы: лѣта по ревизии, когда выбыл, лѣта нынѣ. Лист «Строки» — то же построчно.',
     },
   };
   const DEFAULT_MODE = 'confession';
@@ -47,6 +49,7 @@
     'деревня Рублева':   'рублев',
     'деревня Луки':      'лук(?:и)?' + WE,
     'деревня Мякинина':  '(?:м[яе]кинин|мемин)',
+    'деревня Екатериненская': 'екатерин[а-яё]*ск',
   };
 
   const compiled = {};
@@ -105,6 +108,34 @@
     return out;
   }
 
+  // тип документа по тексту страницы (как page_kind_by_text общего скрипта): 'revision' | 'confession' | null
+  const REV_RX = /(ревиз|сказк|выбыл|нынe|ныне|отлучк|прошлой|по последней)/g;
+  const CONF_RX = /(исповед|причаст|показан|не были|дворов|мужеска|женска)/g;
+  function pageKindByText(t) {
+    const s = String(t || '').toLowerCase().replace(/ѣ/g, 'е').replace(/і/g, 'и');
+    const r = new Set(s.match(REV_RX) || []).size, c = new Set(s.match(CONF_RX) || []).size;
+    if (r >= 2 && r > c) return 'revision';
+    if (c >= 2 && c > r) return 'confession';
+    return null;
+  }
+
+  function kindWarning(kinds, mode) {
+    const rev = kinds.filter((k) => k === 'revision').length, conf = kinds.filter((k) => k === 'confession').length;
+    if (mode === 'confession' && rev > conf) return `⚠ по тексту это ревизская сказка (${rev} стр. из ${kinds.length}) — разобрана как исповедная ведомость; для точного результата обработайте эту ссылку в режиме «Ревизские сказки»`;
+    if (mode === 'revision' && conf > rev) return `⚠ по тексту это исповедная ведомость (${conf} стр. из ${kinds.length}) — разобрана как ревизская сказка; обработайте эту ссылку в режиме «Исповедные ведомости»`;
+    return '';
+  }
+
+  // год документа по тексту: «1782» или «6 ревизия» / «по 6-й ревизии» → год ревизии
+  const REVISION_YEARS = { 1: 1719, 2: 1745, 3: 1763, 4: 1782, 5: 1795, 6: 1811, 7: 1816, 8: 1834, 9: 1850, 10: 1858 };
+  function yearFromText(t) {
+    const s = String(t || '');
+    let m = s.match(/(?<!\d)(1[5-9]\d\d)(?!\d)/);
+    if (m) return parseInt(m[1], 10);
+    m = s.match(/(?<!\d)(10|[1-9])\s*(?:-?\s*(?:я|й|ой|ая))?\s+ревизи/iu);
+    return m ? REVISION_YEARS[+m[1]] : null;
+  }
+
   // doc — Document (DOMParser) со списком ссылок
   function parseLinks(doc, modeId) {
     const span = getMode(modeId).defaultSpan;
@@ -119,8 +150,7 @@
       seen.add(url);
 
       const holder = a.closest('p') || a;
-      const m = strippedText(holder).match(/(?<!\d)(1[5-9]\d\d)(?!\d)/);
-      const year = m ? parseInt(m[1], 10) : null;
+      const year = yearFromText(strippedText(holder));
 
       let note = '';
       let fileId = null, pFrom = null, pTo = null;
@@ -202,7 +232,7 @@
 
   const api = {
     ARCHIVE_HOSTS, MODES, DEFAULT_MODE, getMode, HEADER_MAX_LEN,
-    norm, parseLinks, findSettlements, matchHeader, matchYard, isPrefixOnly,
+    norm, parseLinks, yearFromText, pageKindByText, kindWarning, REVISION_YEARS, findSettlements, matchHeader, matchYard, isPrefixOnly,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Logic = api;

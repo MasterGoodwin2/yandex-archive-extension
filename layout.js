@@ -4,6 +4,8 @@
 // Блок = {t: текст, x, y, w, h} — прямоугольник на странице (в пикселях).
 (function (root) {
   const Logic = root.Logic || (typeof require !== 'undefined' ? require('./logic.js') : null);
+  const RevisionRows = root.RevisionRows || (typeof require !== 'undefined' ? require('./revision-rows.js') : null);
+  const ConfessionRows = root.ConfessionRows || (typeof require !== 'undefined' ? require('./confession-rows.js') : null);
 
   const NUM_RX = /^(?:№|N|n)?\s*(\d{1,3})\s*[.,)]?$/u;            // «5», «5.», «№5»
   const LEAD_NUM_RX = /^(\d{1,3})\s*[.)]\s*(\D.*)$/u;               // «5. Иван Петров»
@@ -30,7 +32,8 @@
   };
 
   function newState() {
-    return { current: null, other: null, fam: null, cols: { m: null, f: null, yard: null }, dropped: 0, pages: 0, blockPages: 0, linePages: 0 };
+    return { current: null, other: null, fam: null, cols: { m: null, f: null, yard: null }, dropped: 0, pages: 0, blockPages: 0, linePages: 0,
+      rows: [], blocks: [], checks: {}, orphans: 0, skipped: [] };
   }
 
   // ---------------------------------------------------------------- семьи
@@ -297,16 +300,243 @@
     return 'строки (координат нет)';
   }
 
+
+  // ----------------------------------------- данные страницы (__NEXT_DATA__), ревизские сказки
+  // Блок «Крестьяне/Крестьянки» целиком (текст НЕ делится на людей), строки таблицы вокруг него —
+  // из соседних столбцов. Блоки с одним номером двора (мужские и женские) попадают в одну семью-двор.
+  const FLAG_NOTE = {
+    family_missing: 'номер двора у блока не найден',
+    family_changes_inside_block: 'внутри блока меняется номер двора — проверить',
+  };
+  const SUSPECT = /^(?:span_conflict|multi_cell|weak_col|y_near)/;
+  const ROLE_LABEL = { age_prev: 'по ревизии', age_mid: 'лѣта', departed_when: 'выбыл', absent_since: 'в отлучке с', age_now: 'нынѣ' };
+
+  function rowText(r) {
+    const parts = [];
+    for (const role of RevisionRows.ROLES) if (r.cells[role]) parts.push(ROLE_LABEL[role] + ': ' + r.cells[role].text);
+    return parts.join(' | ');
+  }
+
+  function totalsText(rep) {
+    const names = { M: 'Муж.', F: 'Жен.' };
+    const parts = Object.keys(rep.totals_check).map((sx) => {
+      const c = rep.totals_check[sx];
+      return `${names[sx]}: итого ${c.expected}, строк без выбытия ${c.rows_present} — ${c.ok ? 'сошлось' : 'НЕ СОШЛОСЬ'}`;
+    });
+    return parts.length ? parts.join('; ') : 'итоги внизу страницы не найдены';
+  }
+
+  // node = currentNode страницы; возвращает метку режима или null (тогда нужен запасной разбор)
+  function processNode(node, page, st, modeId, out) {
+    st.pages++;
+    let rep;
+    try { rep = RevisionRows.process(node); } catch (e) { return null; }
+    if (rep.flags.some((f) => f.startsWith('count_mismatch'))) return null;
+    const ctx = { url: page.url, page: page.page, settlement: null };
+    if (!rep.blocks.length) {
+      st.skipped.push(page.page);
+      return 'данные страницы: нет таблицы «Крестьяне/Крестьянки» — страница пропущена';
+    }
+
+    // населённый пункт — по шапке страницы; повтор того же НП на следующей странице двор не разрывает
+    const t = rep.titles;
+    for (let i = 0; i < t.length; i++) {
+      const h = Logic.matchHeader(t[i], t[i + 1] || '', modeId);
+      if (!h) continue;
+      const same = (h[0] === 'own' && st.current === h[1]) || (h[0] === 'other' && st.other === h[1]);
+      if (!same) applyHeader(st, out, h);
+      break;
+    }
+    const cur = settlementOf(st);
+    if (cur === null) return 'данные страницы: чужой населённый пункт — пропущено';
+    ctx.settlement = cur;
+
+    // семьи-дворы страницы: по номеру двора, по порядку сверху вниз
+    const groups = [];
+    const byNo = new Map();
+    let curG = null;
+    for (const b of rep.blocks.slice().sort((p, q) => p.bbox[1] - q.bbox[1])) {
+      if (b.family_no !== null && b.family_no !== undefined) {
+        if (!byNo.has(b.family_no)) { const g = { no: b.family_no, blocks: [] }; byNo.set(b.family_no, g); groups.push(g); }
+        curG = byNo.get(b.family_no);
+      } else if (!curG) {
+        curG = { no: null, blocks: [] };
+        groups.push(curG);
+      }
+      curG.blocks.push(b);
+    }
+
+    let firstFam = null;
+    for (const g of groups) {
+      let fam;
+      if (g.no === null) {
+        const cont = st.fam && st.fam.settlement === cur;
+        fam = ensureFamily(st, out, ctx);                 // продолжение двора с прошлой страницы
+        if (!cont) addNote(fam, 'номер двора не найден (стр. ' + ctx.page + ')');
+      } else if (st.fam && st.fam.settlement === cur && st.fam.yard === g.no) {
+        fam = st.fam;                                     // тот же двор продолжается на странице
+      } else {
+        startFamily(st, out, g.no, ctx);
+        fam = st.fam;
+      }
+      if (!firstFam) firstFam = fam;
+      g.blocks.sort((p, q) => (p.sex === q.sex ? p.bbox[1] - q.bbox[1] : (p.sex === 'M' ? -1 : 1)));
+      for (const b of g.blocks) {
+        fam.persons.push({ gender: b.sex === 'M' ? 'м' : 'ж', no: '', text: b.names_text, age: '', rows: b.rows.map(rowText) });
+        const rowFlags = b.rows.flatMap((r) => r.flags).filter((f) => SUSPECT.test(f));
+        for (const f of b.flags) if (FLAG_NOTE[f]) addNote(fam, FLAG_NOTE[f] + ' (стр. ' + ctx.page + ')');
+        if (rowFlags.length) addNote(fam, 'проверить строки блока ' + (b.sex === 'M' ? 'м' : 'ж') + b.block_no + ' (стр. ' + ctx.page + '): ' + [...new Set(rowFlags)].join(', '));
+        for (const r of b.rows) {
+          const c = (role) => (r.cells[role] ? r.cells[role].text : '');
+          st.rows.push({ page: ctx.page, url: ctx.url, settlement: cur, yard: fam.yard, sex: b.sex === 'M' ? 'м' : 'ж',
+            blockNo: b.block_no, rowNo: r.row_no, rowsInBlock: b.rows_in_block, names: b.names_text,
+            agePrev: c('age_prev'), departed: c('departed_when'), absent: c('absent_since'), ageNow: c('age_now'),
+            flags: b.flags.concat(r.flags).join(';') });
+        }
+      }
+    }
+    if (rep.orphans.length) {
+      st.orphans += rep.orphans.length;
+      if (firstFam) addNote(firstFam, 'несопоставленные ячейки (стр. ' + ctx.page + '): ' + rep.orphans.map((o) => o.text).join(' | '));
+    }
+    st.checks[ctx.page] = totalsText(rep);
+    for (const f of rep.flags) if (f.startsWith('totals_mismatch') && firstFam) addNote(firstFam, 'итоги страницы не сошлись (стр. ' + ctx.page + '): ' + totalsText(rep));
+    st.blockPages++;
+    return 'данные страницы (__NEXT_DATA__): блоков ' + rep.blocks.length + ', строк ' + rep.blocks.reduce((a, b) => a + b.rows_in_block, 0);
+  }
+
+  // ----------------------------------------- данные страницы (__NEXT_DATA__), исповедные ведомости
+  // Основной блок (список людей) — текст как распознан, НЕ делится на людей. К нему привязаны соседние столбцы:
+  // слева № двора, № мужчины, № женщины; справа лѣта мужеска / женска. «Показанія дѣйства» не собираются.
+  // Один человек = одна строка таблицы (номер и возраст на одной высоте). Двор действует вниз до следующего номера.
+  const CONF_FLAG_NOTE = {
+    age_without_number: 'возраст без номера человека',
+    no_main_block: 'строка не попала ни в один блок текста',
+    two_yard_numbers: 'два номера двора у одной строки',
+    split_cell: 'два номера в одной ячейке разделены по высоте',
+    sex_unknown: 'пол не определён (возраст из общего столбца) — проверить',
+  };
+  // пояснения к людям (не ошибки)
+  const CONF_INFO_NOTE = {
+    age_next_line: 'ⓘ возраст записан строкой ниже номера',
+  };
+  // пояснения к странице (не ошибки): что алгоритм сделал со столбцами
+  const CONF_PAGE_INFO = {
+    age_column_split: 'столбцы возраста мужчин и женщин слиты — разделены по положению',
+    number_column_split: 'столбцы номеров мужчин и женщин слиты — разделены по положению',
+    age_by_row: 'один столбец возраста — пол взят по номеру в строке',
+    no_person_numbers: 'форма ведомости без нумерации людей',
+  };
+
+  // флаги страницы — по-русски
+  function humanFlag(f) {
+    let m;
+    if ((m = f.match(/^half(\d+):(.*)$/))) return 'лист ' + m[1] + ': ' + humanFlag(m[2]);
+    if ((m = f.match(/^seq_breaks_([MF])=(\d+)\/(\d+)/))) return `номера ${m[1] === 'M' ? 'мужчин' : 'женщин'} не подряд в ${m[2]} местах из ${m[3]} (пропуск или ошибка распознавания)`;
+    if ((m = f.match(/^age_columns_(\d)/))) return `найдено столбцов возраста: ${m[1]} из 2`;
+    if (f === 'yard_column_not_found') return 'столбец № двора не найден';
+    if (f === 'age_zone_wide') return 'столбцы возраста найдены дальше обычного от списка';
+    if (CONF_PAGE_INFO[f]) return CONF_PAGE_INFO[f];
+    if (f === 'left_columns_2_sex_unknown') return 'слева найдено 2 столбца из 3 — пол по номеру не определён';
+    if ((m = f.match(/^orphans:(\d+)/))) return `номеров двора без строки: ${m[1]}`;
+    return f;
+  }
+
+  function processConfessionNode(node, page, st, modeId, out) {
+    st.pages++;
+    let rep;
+    try { rep = ConfessionRows.process(node); } catch (e) { return null; }
+    if (rep.flags.some((f) => f.startsWith('count_mismatch'))) return null;
+    st.lastRep = rep;
+    const ctx = { url: page.url, page: page.page, settlement: null };
+    if (!rep.persons.length) {
+      st.skipped.push(page.page);
+      st.checks[page.page] = 'таблица не найдена: ' + rep.flags.join(', ');
+      return 'данные страницы: таблица людей не найдена — страница пропущена (' + rep.flags.join(', ') + ')';
+    }
+    let lastBlockKey = null, curPerson = null, firstFam = null;
+    let kept = 0;
+    const rowsStart = st.rows.length;
+    if (!st.blocks) st.blocks = [];
+    for (const [pi, p] of rep.persons.entries()) {
+      if (!st.current && !st.other && !p.settlement_here && ConfessionRows.numberingRestart(rep.persons, pi)) {
+        // до первого заголовка НП нумерация людей началась с 1 — отсюда ведомость прихода, её первый НП по порядку
+        const order = page.year && page.year < 1750 ? ConfessionRows.ORDER_BEFORE_1750 : ConfessionRows.ORDER_FROM_1750;
+        applyHeader(st, out, ['own', order[0]]);
+        st.pendingNote = 'НП по порядку: начало ведомости, нумерация людей с 1 (стр. ' + page.page + ')';
+        lastBlockKey = null;
+      }
+      if (p.settlement_here) {
+        const [name, note] = ConfessionRows.resolveSettlement(p.settlement_here, st.current, page.year);
+        const own = !String(name).startsWith('чужой НП');
+        const same = own && st.current === name;
+        if (!same) applyHeader(st, out, own ? ['own', name] : ['other', name]);
+        if (note) st.pendingNote = note + ' (стр. ' + page.page + ')';
+        lastBlockKey = null;
+      }
+      const cur = settlementOf(st);
+      if (cur === null) continue;                       // чужой населённый пункт — не собираем
+      ctx.settlement = cur;
+      if (p.yard_mark) {
+        if (!(st.fam && st.fam.settlement === cur && String(st.fam.yard) === String(p.yard_mark))) {
+          startFamily(st, out, parseInt(p.yard_mark, 10), ctx);
+        }
+        lastBlockKey = null;
+      }
+      const fam = ensureFamily(st, out, ctx);
+      if (!firstFam) firstFam = fam;
+      const notes = [];                                   // примечание к строке человека
+      if (st.pendingNote) { addNote(fam, st.pendingNote); notes.push(st.pendingNote); st.pendingNote = null; }
+      if (fam.noYard && !fam.noYardNoted) { const t = 'номер двора не найден (стр. ' + page.page + ')'; addNote(fam, t); notes.push(t); fam.noYardNoted = true; }
+      const blockKey = page.page + ':' + (p.block_id || 'нет');
+      if (blockKey !== lastBlockKey || !curPerson || fam.persons[fam.persons.length - 1] !== curPerson) {
+        curPerson = { gender: '', no: '', text: p.names_text || '(текст блока не найден)', age: '', rows: [] };
+        fam.persons.push(curPerson);
+        lastBlockKey = blockKey;
+        st.blocks.push({ page: page.page, url: page.url, settlement: cur, yard: fam.yard, text: p.names_text || '', persons: 0 });
+      }
+      st.blocks[st.blocks.length - 1].persons++;
+      const sx = p.sex === 'M' ? 'м' : 'ж';
+      curPerson.rows.push(sx + (p.no ? '№' + p.no : '№?') + (p.age ? ', возр. ' + p.age : ''));
+      for (const f of p.flags) {
+        if (CONF_FLAG_NOTE[f]) { addNote(fam, CONF_FLAG_NOTE[f] + ' (стр. ' + page.page + ')'); notes.push(CONF_FLAG_NOTE[f]); }
+        if (CONF_INFO_NOTE[f]) notes.push(CONF_INFO_NOTE[f]);
+        if (f.startsWith('split:')) notes.push(f.slice(6));
+        // номера, исправленные по соседям (сквозная нумерация): только в строку человека
+        let fm;
+        if ((fm = f.match(/^no_fixed:(.*)$/))) notes.push(`номер исправлен по соседям (распознано «${fm[1]}»)`);
+        if ((fm = f.match(/^joined_cell:(.*)$/))) notes.push(`номер склеен из «${fm[1]}»`);
+        if ((fm = f.match(/^extra_number:(.*)$/))) notes.push(`число «${fm[1]}» в столбце номеров — не номер человека`);
+        if (f === 'no_restored') notes.push('номер не распознан, восстановлен по соседям');
+      }
+      st.rows.push({ page: page.page, url: page.url, settlement: cur, yard: fam.yard, half: p.half, sex: sx, no: p.no,
+        age: p.age, inBlock: p.person_in_block, person: p.person_text || '', names: p.names_text, notes, flags: p.flags.join(';') });
+      kept++;
+    }
+    const pageFlags = rep.flags.filter((f) => /seq_breaks|age_columns|yard_column|left_columns|orphans/.test(f));
+    if (pageFlags.length && firstFam) addNote(firstFam, 'проверить страницу ' + page.page + ': ' + pageFlags.map(humanFlag).join('; '));
+    if (pageFlags.length && st.rows.length > rowsStart) st.rows[rowsStart].notes.push('проверить страницу ' + page.page + ': ' + pageFlags.map(humanFlag).join('; '));
+    const infoFlags = rep.flags.filter((f) => CONF_PAGE_INFO[f.replace(/^half\d+:/, '')]);
+    if (infoFlags.length && st.rows.length > rowsStart) st.rows[rowsStart].notes.push('ⓘ стр. ' + page.page + ': ' + infoFlags.map(humanFlag).join('; '));
+    st.checks[page.page] = rep.halves.map((h) => 'лист ' + h.no + ': ' +
+      ['yard', 'm_no', 'f_no', 'age_m', 'age_f'].map((k) => ({ yard: 'двор', m_no: '№м', f_no: '№ж', age_m: 'возр.м', age_f: 'возр.ж' }[k]) + '=' + (h.columns[k] ? h.columns[k].cells : 0)).join(' ') +
+      ', людей ' + h.people).join('; ') + (rep.flags.length ? ' | ' + rep.flags.map(humanFlag).join('; ') : '');
+    st.blockPages++;
+    return 'данные страницы (__NEXT_DATA__): листов ' + rep.halves.length + ', людей ' + rep.persons.length + (kept !== rep.persons.length ? ` (в округе ${kept})` : '');
+  }
+
   function finish(st, out) { flush(st, out); }
 
   // ------------------------------------------------------------ вывод в ячейку
   function formatPerson(p) {
     const label = (p.gender || '') + (p.no !== '' && p.no !== undefined ? '№' + p.no : '');
-    return (label ? label + ' ' : '') + p.text + (p.age !== '' && p.age !== undefined ? ', возр. ' + p.age : '');
+    const head = (label ? label + ' ' : '') + p.text + (p.age !== '' && p.age !== undefined ? ', возр. ' + p.age : '');
+    if (!p.rows || !p.rows.length) return head;
+    return head + '\n' + p.rows.map((r, i) => '   ' + (i + 1) + ') ' + (r || '—')).join('\n');
   }
   const familyCell = (fam) => fam.persons.map(formatPerson).join('\n');
 
-  const api = { newState, processPage, finish, formatPerson, familyCell, atomize, clusterRows, isTable };
+  const api = { newState, processPage, processNode, processConfessionNode, finish, formatPerson, familyCell, atomize, clusterRows, isTable };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.Layout = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

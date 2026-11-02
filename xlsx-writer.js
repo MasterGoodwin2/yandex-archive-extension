@@ -1,6 +1,8 @@
 // Минимальная запись .xlsx без сторонних библиотек.
 // .xlsx = zip из XML-файлов. Строки хранятся как inlineStr, числа — как числа.
-// Использование: const bytes = await XlsxWriter.build([{name, rows, widths}]);
+// Использование: const bytes = await XlsxWriter.build([{name, rows, widths, styleAt, merges, links}]);
+// styleAt(r, c) -> номер стиля (XlsxWriter.STYLE), описание стиля {fill, bold, italic, link, rotate, h, v, wrap, border} или undefined; merges — [[r1, c1, r2, c2], …] (с нуля, включительно);
+// links — [[r, c, адрес], …]: гиперссылка ячейки (http(s) или относительный путь к файлу, например ../../Archive_Scans/x.jpg).
 (function (root) {
   const enc = new TextEncoder();
 
@@ -124,10 +126,11 @@
     return s;
   }
 
-  function sheetXml(rows, widths) {
+  function sheetXml(rows, widths, styleAt, merges, links, book) {
     const out = [];
     out.push('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>');
-    out.push('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">');
+    out.push('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">');
     out.push('<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>');
     if (widths && widths.length) {
       out.push('<cols>');
@@ -138,9 +141,15 @@
     rows.forEach((row, r) => {
       out.push(`<row r="${r + 1}">`);
       row.forEach((v, c) => {
-        if (v === null || v === undefined || v === '') return;
+        const raw = r > 0 && styleAt ? styleAt(r, c) : undefined;
+        const st = raw === undefined || raw === null ? 0 : book.xf(raw);
         const ref = colName(c) + (r + 1);
-        const style = r === 0 ? ' s="1"' : (typeof v === 'string' && v.includes('\n') ? ' s="2"' : '');
+        if (v === null || v === undefined || v === '') {
+          if (st) out.push(`<c r="${ref}" s="${st}"/>`);     // пустая ячейка с заливкой (внутри объединения)
+          return;
+        }
+        const sid = r === 0 ? book.xf(STYLE.HEAD) : st || (typeof v === 'string' && v.includes('\n') ? book.xf(STYLE.WRAP) : 0);
+        const style = sid ? ` s="${sid}"` : '';
         if (typeof v === 'number' && Number.isFinite(v)) {
           out.push(`<c r="${ref}"${style}><v>${v}</v></c>`);
         } else {
@@ -149,21 +158,89 @@
       });
       out.push('</row>');
     });
-    out.push('</sheetData></worksheet>');
+    out.push('</sheetData>');
+    const mg = (merges || []).filter((m) => m[2] > m[0] || m[3] > m[1]);
+    if (mg.length) {
+      out.push(`<mergeCells count="${mg.length}">`);
+      mg.forEach(([r1, c1, r2, c2]) => out.push(`<mergeCell ref="${colName(c1)}${r1 + 1}:${colName(c2)}${r2 + 1}"/>`));
+      out.push('</mergeCells>');
+    }
+    if (links && links.length) {
+      out.push('<hyperlinks>');
+      links.forEach(([r, c], i) => out.push(`<hyperlink ref="${colName(c)}${r + 1}" r:id="rIdL${i + 1}"/>`));
+      out.push('</hyperlinks>');
+    }
+    out.push('</worksheet>');
     return out.join('');
   }
 
-  const STYLES =
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
-    '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>' +
-    '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>' +
-    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
-    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
-    '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
-    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>' +
-    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf></cellXfs>' +
-    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
+  // ---------- стили ----------
+  // styleAt(r, c) возвращает номер готового стиля (STYLE.*) или описание:
+  //   { fill: 'E2EFDA', bold, italic, link, rotate: 90, h: 'center', v: 'center'|'top', wrap, border }
+  // Одинаковые описания — один стиль файла (cellXfs), цвета — любые.
+  const STYLE = { NORMAL: 0, HEAD: 1, WRAP: 2, SETTLEMENT: 3, YARD: 4, YARD_CALC: 5, PERSON: 6, LINK: 7 };
+  const PRESET = {
+    0: {}, 1: { bold: true, v: 'center', wrap: true, fill: 'D9D9D9' }, 2: { v: 'top', wrap: true },
+    3: { bold: true, fill: 'E2EFDA', border: true, h: 'center', v: 'center', rotate: 90, wrap: true },
+    4: { bold: true, fill: 'FFF2CC', border: true, h: 'center', v: 'center' },
+    5: { bold: true, italic: true, fill: 'FFF2CC', border: true, h: 'center', v: 'center' },
+    6: { border: true, v: 'center', wrap: true }, 7: { link: true, border: true, v: 'center', wrap: true },
+  };
+
+  class StyleBook {
+    constructor() {
+      this.fonts = ['<font><sz val="11"/><name val="Calibri"/></font>'];
+      this.fills = ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>'];
+      this.xfs = ['<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'];
+      this.byKey = new Map([['{}', 0]]);
+      this.fontIx = new Map(); this.fillIx = new Map();
+    }
+    font(sp) {
+      const k = `${!!sp.bold}${!!sp.italic}${!!sp.link}`;
+      if (k === 'falsefalsefalse') return 0;
+      if (!this.fontIx.has(k)) {
+        this.fontIx.set(k, this.fonts.length);
+        this.fonts.push(`<font>${sp.bold ? '<b/>' : ''}${sp.italic ? '<i/>' : ''}${sp.link ? '<u/>' : ''}<sz val="11"/>` +
+          `${sp.link ? '<color rgb="FF0563C1"/>' : ''}<name val="Calibri"/></font>`);
+      }
+      return this.fontIx.get(k);
+    }
+    fill(rgb) {
+      if (!rgb) return 0;
+      const k = String(rgb).replace('#', '').toUpperCase().slice(-6);
+      if (!this.fillIx.has(k)) {
+        this.fillIx.set(k, this.fills.length);
+        this.fills.push(`<fill><patternFill patternType="solid"><fgColor rgb="FF${k}"/><bgColor indexed="64"/></patternFill></fill>`);
+      }
+      return this.fillIx.get(k);
+    }
+    xf(st) {
+      const sp = typeof st === 'number' ? (PRESET[st] || {}) : (st || {});
+      const key = JSON.stringify(Object.keys(sp).sort().reduce((o, k) => { if (sp[k] !== undefined && sp[k] !== false) o[k] = sp[k]; return o; }, {}));
+      if (this.byKey.has(key)) return this.byKey.get(key);
+      const fo = this.font(sp), fi = this.fill(sp.fill), bo = sp.border ? 1 : 0;
+      const al = [sp.h ? `horizontal="${sp.h}"` : '', sp.v ? `vertical="${sp.v}"` : '', sp.rotate ? `textRotation="${sp.rotate}"` : '',
+        sp.wrap ? 'wrapText="1"' : ''].filter(Boolean).join(' ');
+      const id = this.xfs.length;
+      this.xfs.push(`<xf numFmtId="0" fontId="${fo}" fillId="${fi}" borderId="${bo}" xfId="0"` +
+        `${fo ? ' applyFont="1"' : ''}${fi ? ' applyFill="1"' : ''}${bo ? ' applyBorder="1"' : ''}` +
+        (al ? ` applyAlignment="1"><alignment ${al}/></xf>` : '/>'));
+      this.byKey.set(key, id);
+      return id;
+    }
+    xml() {
+      const thin = '<left style="thin"><color rgb="FFBFBFBF"/></left><right style="thin"><color rgb="FFBFBFBF"/></right>' +
+        '<top style="thin"><color rgb="FFBFBFBF"/></top><bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/>';
+      return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+        `<fonts count="${this.fonts.length}">${this.fonts.join('')}</fonts>` +
+        `<fills count="${this.fills.length}">${this.fills.join('')}</fills>` +
+        `<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border>${thin}</border></borders>` +
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+        `<cellXfs count="${this.xfs.length}">${this.xfs.join('')}</cellXfs>` +
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
+    }
+  }
 
   async function build(sheets) {
     const files = [];
@@ -210,13 +287,26 @@
     rels += '</Relationships>';
     add('xl/_rels/workbook.xml.rels', rels);
 
-    add('xl/styles.xml', STYLES);
-    sheets.forEach((s, i) => add(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(s.rows, s.widths)));
+    const book = new StyleBook();
+    book.xf(STYLE.HEAD); book.xf(STYLE.WRAP);
+    sheets.forEach((s, i) => {
+      add(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(s.rows, s.widths, s.styleAt, s.merges, s.links, book));
+      if (s.links && s.links.length) {
+        let lr = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+          '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
+        s.links.forEach(([, , target], k) => {
+          lr += `<Relationship Id="rIdL${k + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" ` +
+            `Target="${xmlEscape(target)}" TargetMode="External"/>`;
+        });
+        add(`xl/worksheets/_rels/sheet${i + 1}.xml.rels`, lr + '</Relationships>');
+      }
+    });
 
+    add('xl/styles.xml', book.xml());
     return makeZip(files);
   }
 
-  const api = { build };
+  const api = { build, STYLE };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.XlsxWriter = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
